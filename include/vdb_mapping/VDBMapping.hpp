@@ -667,6 +667,17 @@ public:
                 std::vector<openvdb::Vec3d>& end_points)
   {
     std::shared_lock map_lock(*m_map_mutex);
+
+    if (!m_volume_ray_intersector)
+    {
+      std::cerr << "Volume ray intersector not initialized. "
+                << "Ensure fast_mode is enabled and point cloud data has been inserted."
+                << std::endl;
+      successes.assign(ray_origins_world.size(), false);
+      end_points.resize(ray_origins_world.size());
+      return;
+    }
+
     typename GridT::Accessor acc = m_vdb_grid->getAccessor();
     successes.resize(ray_origins_world.size());
     end_points.resize(ray_origins_world.size());
@@ -1502,9 +1513,11 @@ protected:
    */
   std::string m_map_directory_path;
   /*!
-   * \brief Flag checking wether a valid config was already loaded
+   * \brief Flag checking whether a valid config was already loaded.
+   * Atomic because it is read by background threads (accumulation/integration)
+   * and written by setConfig from the main thread.
    */
-  bool m_config_set;
+  std::atomic<bool> m_config_set;
 
   /*!
    * \brief Compression level for grid compression
