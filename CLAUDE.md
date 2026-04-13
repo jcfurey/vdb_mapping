@@ -77,7 +77,7 @@ using UpdateGridT = openvdb::Grid<openvdb::tree::Tree4<bool, 1, 4, 3>::Type>;
 ### Dependencies
 
 ```bash
-apt-get install -y libeigen3-dev libtbb-dev libpcl-dev libilmbase-dev
+apt-get install -y libeigen3-dev libtbb-dev libpcl-dev libilmbase-dev libzstd-dev
 ```
 
 OpenVDB >= 8.3 is required (v9.0.0+ from source recommended since apt packages are outdated).
