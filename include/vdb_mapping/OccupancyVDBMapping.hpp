@@ -58,10 +58,7 @@ public:
    */
   inline void setConfig(const Config& config) override
   {
-    // call base class function
-    VDBMapping::setConfig(config);
-
-    // Sanity Check for input config
+    // Validate occupancy-specific config before applying base config
     if (config.prob_miss > 0.5)
     {
       std::cerr << "Probability for a miss should be below 0.5 but is " << config.prob_miss
@@ -74,6 +71,9 @@ public:
                 << std::endl;
       return;
     }
+
+    // call base class function after validation passes
+    VDBMapping::setConfig(config);
 
     // Store probabilities as log odds
     m_logodds_miss = static_cast<float>(log(config.prob_miss) - log(1 - config.prob_miss));
