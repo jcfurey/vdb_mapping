@@ -481,12 +481,17 @@ public:
       return false;
     }
 
-    RayT ray;
-    DDAT dda;
-
-
     // Ray origin in world coordinates
     openvdb::Vec3d ray_origin_world(origin.x(), origin.y(), origin.z());
+
+    // Check origin for NaN once before the loop since it is constant
+    if (std::isnan(ray_origin_world.x()) || std::isnan(ray_origin_world.y()) ||
+        std::isnan(ray_origin_world.z()))
+    {
+      std::cerr << "Ray origin contains NaN values" << std::endl;
+      return false;
+    }
+
     // Ray origin in index coordinates
     openvdb::Coord ray_origin_index = this->worldToIndex(ray_origin_world);
     // Ray end point in world coordinates
@@ -501,10 +506,8 @@ public:
       ray_end_world      = openvdb::Vec3d(pt.x, pt.y, pt.z);
       bool max_range_ray = false;
 
-
       if (std::isnan(ray_end_world.x()) || std::isnan(ray_end_world.y()) ||
-          std::isnan(ray_end_world.z()) || std::isnan(ray_origin_world.x()) ||
-          std::isnan(ray_origin_world.y()) || std::isnan(ray_origin_world.z()))
+          std::isnan(ray_end_world.z()))
       {
         continue;
       }
