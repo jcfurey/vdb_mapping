@@ -144,7 +144,7 @@ protected:
 
     typename GridT::Accessor acc = m_vdb_grid->getAccessor();
 
-    for (auto point : cloud->points)
+    for (const auto& point : cloud->points)
     {
       openvdb::Vec3d index_coord =
         m_vdb_grid->worldToIndex(openvdb::Vec3d(point.x, point.y, point.z));
