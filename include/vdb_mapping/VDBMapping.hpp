@@ -602,8 +602,7 @@ public:
   }
 
   /*!
-   * \brief Transforms world to index coordinates. The method additionaly consideres the edge case
-   * where the world coordinates lies directly in between two grids.
+   * \brief Transforms world to index coordinates by rounding to the nearest voxel center
    *
    * \param world_coordinate Coordinate in world space
    *
@@ -611,23 +610,9 @@ public:
    */
   openvdb::Coord worldToIndex(const openvdb::Vec3d& world_coordinate) const
   {
-    openvdb::Vec3d adjusted_world_coordinate = world_coordinate;
-    if (std::fmod(adjusted_world_coordinate.x(), m_resolution))
-    {
-      adjusted_world_coordinate.x() = adjusted_world_coordinate.x() + (m_resolution / 2.0);
-    }
-    if (std::fmod(adjusted_world_coordinate.y(), m_resolution))
-    {
-      adjusted_world_coordinate.y() = adjusted_world_coordinate.y() + (m_resolution / 2.0);
-    }
-    if (std::fmod(adjusted_world_coordinate.z(), m_resolution))
-    {
-      adjusted_world_coordinate.z() = adjusted_world_coordinate.z() + (m_resolution / 2.0);
-    }
-    openvdb::Coord index_coordinate =
-      openvdb::Coord::floor(m_vdb_grid->worldToIndex(adjusted_world_coordinate));
-
-    return index_coordinate;
+    openvdb::Vec3d index_coord = m_vdb_grid->worldToIndex(world_coordinate);
+    return openvdb::Coord::floor(
+      openvdb::Vec3d(index_coord.x() + 0.5, index_coord.y() + 0.5, index_coord.z() + 0.5));
   }
 
   /*!
@@ -655,7 +640,7 @@ public:
     std::vector<bool> successes;
     std::vector<openvdb::Vec3d> end_points;
 
-    raytrace(ray_origins_world, ray_directions, max_ray_lengths, successes, end_points);
+    raytrace(ray_origins_world, ray_directions, max_ray_length, successes, end_points);
 
     success   = successes[0];
     end_point = end_points[0];
