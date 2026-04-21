@@ -708,8 +708,12 @@ public:
           // Intentionally empty. Loop goes on as long as as a next dda step is possible and no
           // active voxel was found along the ray
         };
+        // Only report success if the loop exited on an active voxel. If dda.step()
+        // returned false first, we ran past the intersected tile without hitting
+        // anything occupied — reporting success with an arbitrary end point misleads
+        // consumers (e.g. LoC-recovery raycasts, Nav2 obstacle queries).
         end_points[i] = m_vdb_grid->indexToWorld(dda.voxel());
-        successes[i]  = true;
+        successes[i]  = acc.isValueOn(dda.voxel());
       }
       else
       {
@@ -1631,8 +1635,6 @@ protected:
   std::shared_ptr<openvdb::tools::VolumeRayIntersector<openvdb::FloatGrid> >
     m_volume_ray_intersector;
 };
-
-#include "VDBMapping.hpp"
 
 } // namespace vdb_mapping
 
