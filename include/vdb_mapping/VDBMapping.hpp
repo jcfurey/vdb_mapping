@@ -156,11 +156,14 @@ public:
   /*!
    * \brief Creates a new VDB Grid
    *
-   * \param resolution Resolution of the grid
+   * \param resolution Resolution of the grid (currently unused; the grid
+   *                   transform is derived from m_resolution — callers pass
+   *                   m_resolution today and the parameter is retained for
+   *                   signature stability).
    *
    * \returns Grid shared pointer
    */
-  typename GridT::Ptr createVDBMap(double resolution)
+  typename GridT::Ptr createVDBMap([[maybe_unused]] double resolution)
   {
     typename GridT::Ptr new_map = GridT::create(TData());
     new_map->setTransform(openvdb::math::Transform::createLinearTransform(m_resolution));
@@ -1279,14 +1282,28 @@ public:
    */
   std::string decompressByteArray(const std::vector<uint8_t>& byte_array) const
   {
-    std::size_t len = ZSTD_getDecompressedSize(byte_array.data(), byte_array.size());
+    // ZSTD_getDecompressedSize was deprecated in favour of
+    // ZSTD_getFrameContentSize, which signals "unknown" / "error" via
+    // sentinel values instead of returning 0. Without the check below a
+    // corrupted or non-zstd buffer would allocate (size_t)-1 bytes and OOM
+    // the process.
+    const unsigned long long frame_len =
+      ZSTD_getFrameContentSize(byte_array.data(), byte_array.size());
+
+    std::string map_str;
+    if (frame_len == ZSTD_CONTENTSIZE_ERROR || frame_len == ZSTD_CONTENTSIZE_UNKNOWN)
+    {
+      std::cerr << "Could not determine decompressed size (frame not zstd or missing "
+                   "size header); returning raw data" << std::endl;
+      return std::string(byte_array.begin(), byte_array.end());
+    }
+
+    const std::size_t len = static_cast<std::size_t>(frame_len);
     std::vector<uint8_t> uncompressed(len);
 
     std::size_t size =
       ZSTD_decompress(uncompressed.data(), len, byte_array.data(), byte_array.size());
 
-
-    std::string map_str;
     if (ZSTD_isError(size))
     {
       std::cerr << "Could not decompress map using ZSTD failed: " << ZSTD_getErrorName(size)
@@ -1472,15 +1489,24 @@ public:
   }
 
 protected:
-  virtual bool updateFreeNode(TData& voxel_value, bool& active) { return false; }
-  virtual bool updateOccupiedNode(TData& voxel_value, bool& active) { return false; }
-  virtual bool setNodeToFree(TData& voxel_value, bool& active) { return false; }
-  virtual bool setNodeToOccupied(TData& voxel_value, bool& active) { return false; }
-  virtual bool setNodeState(TData& voxel_value, bool& active) { return false; }
+  // Default no-op implementations — OccupancyVDBMapping (and any other
+  // subclass) overrides these with concrete log-odds behaviour. The params
+  // are named for documentation / IDE completion; [[maybe_unused]] silences
+  // -Wunused-parameter for the default bodies without removing the names.
+  virtual bool updateFreeNode([[maybe_unused]] TData& voxel_value,
+                              [[maybe_unused]] bool& active) { return false; }
+  virtual bool updateOccupiedNode([[maybe_unused]] TData& voxel_value,
+                                  [[maybe_unused]] bool& active) { return false; }
+  virtual bool setNodeToFree([[maybe_unused]] TData& voxel_value,
+                             [[maybe_unused]] bool& active) { return false; }
+  virtual bool setNodeToOccupied([[maybe_unused]] TData& voxel_value,
+                                 [[maybe_unused]] bool& active) { return false; }
+  virtual bool setNodeState([[maybe_unused]] TData& voxel_value,
+                            [[maybe_unused]] bool& active) { return false; }
 
-  virtual void createMapFromPointCloud(const PointCloudT::Ptr& cloud,
-                                       const bool set_background,
-                                       const bool clear_map)
+  virtual void createMapFromPointCloud([[maybe_unused]] const PointCloudT::Ptr& cloud,
+                                       [[maybe_unused]] const bool set_background,
+                                       [[maybe_unused]] const bool clear_map)
   {
     std::cerr << "Not implemented for data type" << std::endl;
   }
