@@ -64,9 +64,9 @@ namespace vdb_mapping {
 struct BaseConfig
 {
   // When redesigning split into static and changable config
-  double max_range;
-  bool fast_mode;
-  double accumulation_period;
+  double max_range           = 10.0;
+  bool fast_mode             = false;
+  double accumulation_period = 1.0;
   std::string map_directory_path;
 };
 
@@ -1481,6 +1481,15 @@ public:
     {
       std::cerr << "Max range of " << config.max_range << " invalid. Range cannot be negative."
                 << std::endl;
+      return;
+    }
+    if (!(config.accumulation_period > 0.0))
+    {
+      // Without this guard, a zero or negative period silently casts to 0 ms
+      // (busy-spin) or wraps to a huge unsigned sleep duration on the
+      // integration thread.
+      std::cerr << "Accumulation period of " << config.accumulation_period
+                << " invalid. Must be a positive number of seconds." << std::endl;
       return;
     }
     m_max_range           = config.max_range;

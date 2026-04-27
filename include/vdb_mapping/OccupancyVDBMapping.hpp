@@ -37,10 +37,10 @@ namespace vdb_mapping {
  */
 struct Config : BaseConfig
 {
-  double prob_hit;
-  double prob_miss;
-  double prob_thres_min;
-  double prob_thres_max;
+  double prob_hit       = 0.7;
+  double prob_miss      = 0.4;
+  double prob_thres_min = 0.12;
+  double prob_thres_max = 0.97;
 };
 
 class OccupancyVDBMapping : public VDBMapping<float, Config>
