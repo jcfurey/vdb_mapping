@@ -1119,11 +1119,20 @@ public:
     openvdb::Vec3d max           = section->template metaValue<openvdb::Vec3d>("bb_max");
     openvdb::CoordBBox bbox(openvdb::Coord::floor(min), openvdb::Coord::floor(max));
 
-    for (auto iter = m_vdb_grid->cbeginValueOn(); iter; ++iter)
+    // Walk only leaves that overlap the section bbox instead of every active
+    // voxel in the entire map.
+    for (auto leaf_iter = m_vdb_grid->tree().cbeginLeaf(); leaf_iter; ++leaf_iter)
     {
-      if (bbox.isInside(iter.getCoord()))
+      if (!leaf_iter.getLeaf()->getNodeBoundingBox().hasOverlap(bbox))
       {
-        acc.setActiveState(iter.getCoord(), false);
+        continue;
+      }
+      for (auto iter = leaf_iter->cbeginValueOn(); iter; ++iter)
+      {
+        if (bbox.isInside(iter.getCoord()))
+        {
+          acc.setActiveState(iter.getCoord(), false);
+        }
       }
     }
     for (auto iter = section->cbeginValueOn(); iter; ++iter)
