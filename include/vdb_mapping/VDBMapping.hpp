@@ -422,8 +422,7 @@ public:
 
     for (const PointT& pt : *cloud)
     {
-      openvdb::Vec3d world_pt(pt.x, pt.y, pt.z);
-      openvdb::Coord index_pt = openvdb::Coord::floor(m_vdb_grid->worldToIndex(world_pt));
+      openvdb::Coord index_pt = this->worldToIndex(openvdb::Vec3d(pt.x, pt.y, pt.z));
       acc.modifyValueAndActiveState(index_pt, set_node);
     }
     return true;
@@ -442,8 +441,7 @@ public:
     };
     for (const PointT& pt : *cloud)
     {
-      openvdb::Vec3d world_pt(pt.x, pt.y, pt.z);
-      openvdb::Coord index_pt = openvdb::Coord::floor(m_vdb_grid->worldToIndex(world_pt));
+      openvdb::Coord index_pt = this->worldToIndex(openvdb::Vec3d(pt.x, pt.y, pt.z));
       acc.modifyValueAndActiveState(index_pt, set_node);
     }
     return true;

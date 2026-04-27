@@ -146,9 +146,8 @@ protected:
 
     for (const auto& point : cloud->points)
     {
-      openvdb::Vec3d index_coord =
-        m_vdb_grid->worldToIndex(openvdb::Vec3d(point.x, point.y, point.z));
-      acc.setValueOn(openvdb::Coord::floor(index_coord), m_max_logodds);
+      acc.setValueOn(this->worldToIndex(openvdb::Vec3d(point.x, point.y, point.z)),
+                     m_max_logodds);
     }
     openvdb::CoordBBox bbox = m_vdb_grid->evalActiveVoxelBoundingBox();
 
