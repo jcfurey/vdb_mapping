@@ -85,7 +85,6 @@ public:
     // Values to clamp the logodds in order to prevent non dynamic map behavior
     m_max_logodds = static_cast<float>(log(0.99) - log(0.01));
     m_min_logodds = static_cast<float>(log(0.01) - log(0.99));
-    m_config_set  = true;
   }
 
 protected:

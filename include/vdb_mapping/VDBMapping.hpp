@@ -128,7 +128,7 @@ public:
     {
       UpdateGridT::registerGrid();
     }
-    m_vdb_grid             = createVDBMap(m_resolution);
+    m_vdb_grid             = createVDBMap();
     m_artificial_area_grid = UpdateGridT::create(false);
     m_integration_thread   = std::thread(&VDBMapping::integrationThread, this);
   }
@@ -156,14 +156,9 @@ public:
   /*!
    * \brief Creates a new VDB Grid
    *
-   * \param resolution Resolution of the grid (currently unused; the grid
-   *                   transform is derived from m_resolution — callers pass
-   *                   m_resolution today and the parameter is retained for
-   *                   signature stability).
-   *
    * \returns Grid shared pointer
    */
-  typename GridT::Ptr createVDBMap([[maybe_unused]] double resolution)
+  typename GridT::Ptr createVDBMap()
   {
     typename GridT::Ptr new_map = GridT::create(TData());
     new_map->setTransform(openvdb::math::Transform::createLinearTransform(m_resolution));
@@ -178,7 +173,7 @@ public:
   {
     std::unique_lock map_lock(*m_map_mutex);
     m_vdb_grid->clear();
-    m_vdb_grid = createVDBMap(m_resolution);
+    m_vdb_grid = createVDBMap();
     map_lock.unlock();
 
     for (auto& [source_id, source] : m_input_sources)
