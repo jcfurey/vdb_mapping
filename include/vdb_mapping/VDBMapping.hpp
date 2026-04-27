@@ -1219,18 +1219,8 @@ public:
    */
   void restoreMapIntegrity()
   {
-    // Set each voxel to its previous state
-    auto restore_state = [&](TData& voxel_value, bool& active) {
-      setNodeState(voxel_value, active);
-    };
-    typename GridT::Accessor acc = m_vdb_grid->getAccessor();
-    for (auto iter = m_artificial_area_grid->cbeginValueOn(); iter; ++iter)
-    {
-      acc.modifyValueAndActiveState(iter.getCoord(), restore_state);
-    }
-    // Clear artificial grid
-    m_artificial_area_grid->clear();
-    m_artificial_areas_present = false;
+    std::unique_lock map_lock(*m_map_mutex);
+    restoreMapIntegrityLocked();
   }
 
   /*!
@@ -1245,49 +1235,47 @@ public:
     const double negative_height,
     const double positive_height)
   {
-    // Restore map integrity by removing all artificial walls
-    restoreMapIntegrity();
+    // The integration thread reads m_artificial_area_grid under the unique map
+    // lock; service callers must serialise with it through the same lock.
+    std::unique_lock map_lock(*m_map_mutex);
+    restoreMapIntegrityLocked();
     m_artificial_areas_present = true;
 
-    // Add all artificial areas
+    UpdateGridT::Accessor artificial_acc = m_artificial_area_grid->getAccessor();
     for (const auto& artificial_area : artificial_areas)
     {
-      addArtificialPolygon(artificial_area, negative_height, positive_height);
+      for (size_t i = 0; i < artificial_area.size(); i++)
+      {
+        addArtificialWallLocked(artificial_area[i],
+                                artificial_area[(i + 1) % artificial_area.size()],
+                                negative_height,
+                                positive_height,
+                                artificial_acc);
+      }
     }
   }
 
-  /*!
-   * \brief Adds a an artificial Area to the map
-   *
-   * \param artificial_areas Area as a polygons
-   * \params negative_height Specifies how low the polygon should be projected
-   * \params positive_height Specifies how high the polygon should be projected
-   */
-  void addArtificialPolygon(const std::vector<Eigen::Matrix<double, 4, 1> >& polygon,
-                            const double negative_height,
-                            const double positive_height)
+protected:
+  void restoreMapIntegrityLocked()
   {
-    for (size_t i = 0; i < polygon.size(); i++)
+    auto restore_state = [&](TData& voxel_value, bool& active) {
+      setNodeState(voxel_value, active);
+    };
+    typename GridT::Accessor acc = m_vdb_grid->getAccessor();
+    for (auto iter = m_artificial_area_grid->cbeginValueOn(); iter; ++iter)
     {
-      addArtificialWall(
-        polygon[i], polygon[(i + 1) % polygon.size()], negative_height, positive_height);
+      acc.modifyValueAndActiveState(iter.getCoord(), restore_state);
     }
+    m_artificial_area_grid->clear();
+    m_artificial_areas_present = false;
   }
 
-  /*!
-   * \brief Adds a an artificial Wall to the map
-   *
-   * \param start Start point of the wall
-   * \param end End point of the wall
-   * \params negative_height Specifies how low the polygon should be projected
-   * \params positive_height Specifies how high the polygon should be projected
-   */
-  void addArtificialWall(const Eigen::Matrix<double, 4, 1>& start,
-                         const Eigen::Matrix<double, 4, 1>& end,
-                         const double negative_height,
-                         const double positive_height)
+  void addArtificialWallLocked(const Eigen::Matrix<double, 4, 1>& start,
+                               const Eigen::Matrix<double, 4, 1>& end,
+                               const double negative_height,
+                               const double positive_height,
+                               UpdateGridT::Accessor& artificial_area_grid_acc)
   {
-    UpdateGridT::Accessor artificial_area_grid_acc = m_artificial_area_grid->getAccessor();
     openvdb::Coord start_index =
       this->worldToIndex(openvdb::Vec3d(start.x(), start.y(), start.z()));
     openvdb::Coord end_index = this->worldToIndex(openvdb::Vec3d(end.x(), end.y(), end.z()));
@@ -1302,6 +1290,8 @@ public:
                       artificial_area_grid_acc);
     }
   }
+
+public:
 
 
   /*!
