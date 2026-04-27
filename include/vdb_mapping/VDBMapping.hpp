@@ -679,6 +679,11 @@ public:
       return;
     }
 
+    // Shallow-copy the shared intersector so concurrent raytrace callers do
+    // not race on setIndexRay/march, which both mutate intersector state.
+    openvdb::tools::VolumeRayIntersector<openvdb::FloatGrid> local_intersector(
+      *m_volume_ray_intersector);
+
     typename GridT::Accessor acc = m_vdb_grid->getAccessor();
     successes.resize(ray_origins_world.size());
     end_points.resize(ray_origins_world.size());
@@ -695,11 +700,11 @@ public:
 
       RayT ray(ray_origin_index, ray_direction_index, 0, 1);
 
-      m_volume_ray_intersector->setIndexRay(ray);
+      local_intersector.setIndexRay(ray);
       double t0;
       double t1;
 
-      if (m_volume_ray_intersector->march(t0, t1))
+      if (local_intersector.march(t0, t1))
       {
         RayT fine_ray(ray_origin_index, ray_direction_index, t0, t1);
         DDAT dda(fine_ray);
