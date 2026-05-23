@@ -496,7 +496,7 @@ if(NOT OPENVDB_USE_STATIC_LIBS AND NOT Boost_USE_STATIC_LIBS)
   set(Boost_USE_STATIC_LIBS OFF)
 endif()
 
-find_package(Boost REQUIRED COMPONENTS iostreams system)
+find_package(Boost REQUIRED COMPONENTS iostreams)
 
 # Add deps for pyopenvdb
 # @todo track for numpy
@@ -673,7 +673,6 @@ endif()
 
 set(_OPENVDB_VISIBLE_DEPENDENCIES
   Boost::iostreams
-  Boost::system
 )
 
 if(OpenVDB_USES_IMATH_HALF)
