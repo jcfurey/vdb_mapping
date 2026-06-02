@@ -1,8 +1,19 @@
 # Devel Bring-up Evaluation
 
 Evaluation of which features from the fork's `devel` branch are worthwhile bringing up
-into `main`. This is an **assessment only** — no source has been changed and nothing has
-been cherry-picked. Use the commands at the bottom to bring up whichever commits you choose.
+into `main`, plus the recommended subset applied to this branch.
+
+> **Status:** the recommended subset (11 commits) has been cherry-picked onto this branch.
+> Applied, in chronological order: `a01da14`, `e07560a`, `22c8110`, `183741c`, `5efd016`,
+> `4902867`, `1b06507`, `6c00fea`, `750f0a3`, `74f8c3c`, `cddc6be`.
+> `4902867` (config default-init + `accumulation_period` validation) was included because the
+> `InvalidConfigRejected` test added by `22c8110` otherwise reads uninitialized `Config` fields.
+> **Not applied** (deliberately): the 3 upstream-`devel` base commits (`7257e76`, `d7a5444`,
+> `68bf9d9`), the docs commits (`8dd882b`, `08e4788`), the ROS2 packaging commit (`a706ef6`),
+> and the cleanup commit (`3af4855`). Use the commands at the bottom to bring up any of those.
+>
+> Not built/verified in CI here — OpenVDB/TBB/Eigen/PCL aren't installed in this environment;
+> the cherry-picks applied without conflict.
 
 ## Branch topology
 
