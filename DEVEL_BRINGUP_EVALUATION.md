@@ -3,14 +3,23 @@
 Evaluation of which features from the fork's `devel` branch are worthwhile bringing up
 into `main`, plus the recommended subset applied to this branch.
 
-> **Status:** the recommended subset (11 commits) has been cherry-picked onto this branch.
-> Applied, in chronological order: `a01da14`, `e07560a`, `22c8110`, `183741c`, `5efd016`,
+> **Status:** 14 commits have been cherry-picked onto this branch.
+> Recommended subset (11): `a01da14`, `e07560a`, `22c8110`, `183741c`, `5efd016`,
 > `4902867`, `1b06507`, `6c00fea`, `750f0a3`, `74f8c3c`, `cddc6be`.
 > `4902867` (config default-init + `accumulation_period` validation) was included because the
 > `InvalidConfigRejected` test added by `22c8110` otherwise reads uninitialized `Config` fields.
-> **Not applied** (deliberately): the 3 upstream-`devel` base commits (`7257e76`, `d7a5444`,
-> `68bf9d9`), the docs commits (`8dd882b`, `08e4788`), the ROS2 packaging commit (`a706ef6`),
-> and the cleanup commit (`3af4855`). Use the commands at the bottom to bring up any of those.
+> Also added on request: `7257e76` (getResolution), `d7a5444` (transformable map sections),
+> and `a706ef6` (package.xml → ROS2 format 3).
+> **Not applied** (deliberately): `68bf9d9` (GitLab-CI-only change, irrelevant here),
+> the docs commits (`8dd882b`, `08e4788`), and the cleanup commit (`3af4855`, removes a
+> public `createVDBMap` parameter for no functional gain).
+> Use the commands at the bottom to bring up either of those.
+>
+> Note: `d7a5444`'s `transformAndApplyMapSection*` functions use `(int)` truncation for
+> world→index conversion rather than the round-to-nearest `worldToIndex` helper that
+> `1b06507` standardized elsewhere. This mirrors the fork's `devel` HEAD exactly (1b06507
+> never touched those functions there either) — noted as a pre-existing inconsistency, not
+> a regression introduced by this bring-up.
 >
 > Not built/verified in CI here — OpenVDB/TBB/Eigen/PCL aren't installed in this environment;
 > the cherry-picks applied without conflict.
