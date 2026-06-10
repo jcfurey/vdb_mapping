@@ -6,5 +6,6 @@ find_dependency(OpenVDB)
 find_dependency(Blosc)
 find_dependency(PCL)
 find_dependency(TBB)
+find_dependency(ZSTD)
 
 include("${CMAKE_CURRENT_LIST_DIR}/vdb_mappingTargets.cmake")

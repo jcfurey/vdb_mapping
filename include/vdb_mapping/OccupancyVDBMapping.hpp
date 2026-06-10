@@ -58,17 +58,26 @@ public:
    */
   inline void setConfig(const Config& config) override
   {
-    // Validate occupancy-specific config before applying base config
-    if (config.prob_miss > 0.5)
+    // Validate occupancy-specific config before applying base config.
+    // All probabilities must lie strictly inside (0, 1); values on or outside
+    // the boundary produce NaN/inf log odds that poison every voxel update.
+    if (!(config.prob_miss > 0.0 && config.prob_miss <= 0.5))
     {
-      std::cerr << "Probability for a miss should be below 0.5 but is " << config.prob_miss
+      std::cerr << "Probability for a miss should be in (0, 0.5] but is " << config.prob_miss
                 << std::endl;
       return;
     }
-    if (config.prob_hit < 0.5)
+    if (!(config.prob_hit >= 0.5 && config.prob_hit < 1.0))
     {
-      std::cerr << "Probability for a hit should be above 0.5 but is " << config.prob_hit
+      std::cerr << "Probability for a hit should be in [0.5, 1) but is " << config.prob_hit
                 << std::endl;
+      return;
+    }
+    if (!(config.prob_thres_min > 0.0 && config.prob_thres_max < 1.0 &&
+          config.prob_thres_min < config.prob_thres_max))
+    {
+      std::cerr << "Probability thresholds must satisfy 0 < min < max < 1 but are min="
+                << config.prob_thres_min << " max=" << config.prob_thres_max << std::endl;
       return;
     }
 
@@ -180,11 +189,11 @@ protected:
    */
   float m_logodds_miss;
   /*!
-   * \brief Upper occupancy probability threshold
+   * \brief Lower occupancy probability threshold below which a voxel is deactivated
    */
   float m_logodds_thres_min;
   /*!
-   * \brief Lower occupancy probability threshold
+   * \brief Upper occupancy probability threshold above which a voxel is activated
    */
   float m_logodds_thres_max;
   /*!

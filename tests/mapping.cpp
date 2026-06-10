@@ -1,4 +1,6 @@
 #include "gtest/gtest.h"
+#include <array>
+#include <vector>
 #include <vdb_mapping/OccupancyVDBMapping.hpp>
 
 namespace vdb_mapping {
@@ -222,6 +224,143 @@ TEST(Mapping, GridSerialization)
   auto restored = map.byteArrayToGrid<OccupancyVDBMapping::GridT>(bytes);
   ASSERT_NE(restored, nullptr);
   EXPECT_EQ(restored->activeVoxelCount(), active_before);
+}
+
+TEST(Mapping, DestructWithoutConfig)
+{
+  // Regression test: the worker threads used to wait for a config forever,
+  // ignoring the stop signal, so destroying an unconfigured map deadlocked.
+  {
+    OccupancyVDBMapping map(1);
+  }
+  {
+    OccupancyVDBMapping map(1);
+    map.addInputSource("test", 10, 0);
+  }
+  SUCCEED();
+}
+
+namespace {
+// Builds a fast-mode map and inserts the given obstacle points so that the
+// volume ray intersectors are initialized for raytrace queries.
+void setupFastModeMap(OccupancyVDBMapping& map,
+                      const std::vector<std::array<float, 3> >& obstacles)
+{
+  Config conf;
+  conf.max_range      = 50;
+  conf.fast_mode      = true;
+  conf.prob_hit       = 0.9;
+  conf.prob_miss      = 0.1;
+  conf.prob_thres_max = 0.51;
+  conf.prob_thres_min = 0.49;
+  map.setConfig(conf);
+  map.addInputSource("test", conf.max_range, 0);
+
+  OccupancyVDBMapping::PointCloudT::Ptr cloud(new OccupancyVDBMapping::PointCloudT);
+  for (const auto& p : obstacles)
+  {
+    cloud->points.emplace_back(p[0], p[1], p[2]);
+  }
+  map.addPointsToGrid(cloud);
+
+  // Trigger updateVolumeRayIntersectors via an empty integration cycle
+  OccupancyVDBMapping::PointCloudT::Ptr empty_cloud(new OccupancyVDBMapping::PointCloudT);
+  Eigen::Matrix<double, 3, 1> origin(0, 0, 0);
+  map.insertPointCloud(empty_cloud, origin, "test");
+}
+} // namespace
+
+TEST(Mapping, RaytraceLeafAlignedObstacle)
+{
+  // Regression test: the span walk stepped before checking, skipping the
+  // first voxel of each intersected span. Leaf nodes are 8^3 aligned, so an
+  // obstacle at a leaf-aligned index (200 here) was never reported.
+  double resolution = 0.1;
+  OccupancyVDBMapping map(resolution);
+  setupFastModeMap(map, {{20.0f, 0.0f, 0.0f}});
+
+  bool success;
+  openvdb::Vec3d end_point;
+  map.raytrace(openvdb::Vec3d(0, 0, 0), openvdb::Vec3d(1, 0, 0), 30.0, success, end_point);
+  EXPECT_TRUE(success);
+  EXPECT_NEAR(end_point.x(), 20.0, resolution);
+  EXPECT_NEAR(end_point.y(), 0.0, resolution);
+  EXPECT_NEAR(end_point.z(), 0.0, resolution);
+}
+
+TEST(Mapping, RaytraceMultiSpan)
+{
+  // Regression test: raytrace only marched the first intersected leaf span.
+  // An active voxel near (but not on) the ray made the query give up before
+  // reaching the actual obstacle further along the ray.
+  double resolution = 0.1;
+  OccupancyVDBMapping map(resolution);
+  setupFastModeMap(map, {{20.0f, 0.0f, 0.0f}, {10.0f, 0.7f, 0.0f}});
+
+  bool success;
+  openvdb::Vec3d end_point;
+  map.raytrace(openvdb::Vec3d(0, 0, 0), openvdb::Vec3d(1, 0, 0), 30.0, success, end_point);
+  EXPECT_TRUE(success);
+  EXPECT_NEAR(end_point.x(), 20.0, resolution);
+}
+
+TEST(Mapping, RaytraceFromNearObstacle)
+{
+  // Regression test: a ray starting inside an occupied leaf node tripped an
+  // OpenVDB Ray::setTimes assertion (t0 must be > 0) and aborted the process.
+  double resolution = 0.1;
+  OccupancyVDBMapping map(resolution);
+  setupFastModeMap(map, {{20.0f, 0.0f, 0.0f}});
+
+  bool success;
+  openvdb::Vec3d end_point;
+  map.raytrace(openvdb::Vec3d(19.85, 0, 0), openvdb::Vec3d(1, 0, 0), 5.0, success, end_point);
+  EXPECT_TRUE(success);
+  EXPECT_NEAR(end_point.x(), 20.0, resolution);
+
+  // Ray pointing away from the obstacle must not report a hit
+  map.raytrace(openvdb::Vec3d(25.0, 0, 0), openvdb::Vec3d(1, 0, 0), 5.0, success, end_point);
+  EXPECT_FALSE(success);
+}
+
+TEST(Mapping, MapSectionPreservesValues)
+{
+  // Regression test: sparse map section extraction flattened all float voxel
+  // values to 1.0 instead of preserving the stored log odds.
+  OccupancyVDBMapping map(1);
+  Config conf;
+  conf.max_range      = 10;
+  conf.fast_mode      = false;
+  conf.prob_hit       = 0.9;
+  conf.prob_miss      = 0.1;
+  conf.prob_thres_max = 0.51;
+  conf.prob_thres_min = 0.49;
+  map.setConfig(conf);
+  map.addInputSource("test", conf.max_range, 0);
+
+  auto log_hit = static_cast<float>(log(conf.prob_hit) - log(1 - conf.prob_hit));
+
+  OccupancyVDBMapping::PointCloudT::Ptr cloud(new OccupancyVDBMapping::PointCloudT);
+  cloud->points.emplace_back(0, 0, 1);
+  Eigen::Matrix<double, 3, 1> origin(0, 0, 0);
+  map.insertPointCloud(cloud, origin, "test");
+
+  Eigen::Matrix<double, 3, 1> min_boundary(-5, -5, -5);
+  Eigen::Matrix<double, 3, 1> max_boundary(5, 5, 5);
+  Eigen::Matrix<double, 4, 4> identity = Eigen::Matrix<double, 4, 4>::Identity();
+
+  auto section = map.getMapSectionGrid(min_boundary, max_boundary, identity, false);
+  OccupancyVDBMapping::GridT::Accessor section_acc = section->getAccessor();
+  EXPECT_TRUE(section_acc.isValueOn(openvdb::Coord(0, 0, 1)));
+  EXPECT_FLOAT_EQ(section_acc.getValue(openvdb::Coord(0, 0, 1)), log_hit);
+}
+
+TEST(Mapping, ByteArrayToGridRejectsGarbage)
+{
+  OccupancyVDBMapping map(1);
+  std::vector<uint8_t> garbage = {0xde, 0xad, 0xbe, 0xef, 0x42};
+  auto grid = map.byteArrayToGrid<OccupancyVDBMapping::GridT>(garbage);
+  EXPECT_EQ(grid, nullptr);
 }
 
 TEST(Mapping, MorphologicalDilateErode)
