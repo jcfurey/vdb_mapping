@@ -63,21 +63,25 @@ public:
     // the boundary produce NaN/inf log odds that poison every voxel update.
     if (!(config.prob_miss > 0.0 && config.prob_miss <= 0.5))
     {
-      std::cerr << "Probability for a miss should be in (0, 0.5] but is " << config.prob_miss
-                << std::endl;
+      logMessage(LogLevel::Error,
+                 "Probability for a miss should be in (0, 0.5] but is " +
+                   std::to_string(config.prob_miss));
       return;
     }
     if (!(config.prob_hit >= 0.5 && config.prob_hit < 1.0))
     {
-      std::cerr << "Probability for a hit should be in [0.5, 1) but is " << config.prob_hit
-                << std::endl;
+      logMessage(LogLevel::Error,
+                 "Probability for a hit should be in [0.5, 1) but is " +
+                   std::to_string(config.prob_hit));
       return;
     }
     if (!(config.prob_thres_min > 0.0 && config.prob_thres_max < 1.0 &&
           config.prob_thres_min < config.prob_thres_max))
     {
-      std::cerr << "Probability thresholds must satisfy 0 < min < max < 1 but are min="
-                << config.prob_thres_min << " max=" << config.prob_thres_max << std::endl;
+      logMessage(LogLevel::Error,
+                 "Probability thresholds must satisfy 0 < min < max < 1 but are min=" +
+                   std::to_string(config.prob_thres_min) +
+                   " max=" + std::to_string(config.prob_thres_max));
       return;
     }
 
@@ -141,10 +145,17 @@ protected:
     return true;
   }
 
-  inline void createMapFromPointCloud(const PointCloudT::Ptr& cloud,
+  inline bool createMapFromPointCloud(const PointCloudT::Ptr& cloud,
                                       const bool set_background,
                                       const bool clear_map) override
   {
+    if (!m_config_set)
+    {
+      // The log-odds members are uninitialized until setConfig has run;
+      // writing them into the grid would store garbage values.
+      logMessage(LogLevel::Error, "Map not properly configured. Did you call setConfig method?");
+      return false;
+    }
     if (clear_map)
     {
       m_vdb_grid->clear();
@@ -154,30 +165,35 @@ protected:
 
     for (const auto& point : cloud->points)
     {
-      acc.setValueOn(this->worldToIndex(openvdb::Vec3d(point.x, point.y, point.z)),
-                     m_max_logodds);
+      acc.setValueOn(this->worldToIndex(openvdb::Vec3d(point.x, point.y, point.z)), m_max_logodds);
     }
-    openvdb::CoordBBox bbox = m_vdb_grid->evalActiveVoxelBoundingBox();
 
     if (set_background)
     {
-      for (int x = bbox.min().x(); x <= bbox.max().x(); ++x)
+      // Sparse-fill the bounding box with the free-space value instead of
+      // visiting every voxel: the previous dense triple loop was O(volume)
+      // and allocated leaf nodes for the entire box. sparseFill overwrites
+      // everything inside the box, so stash the occupied voxels and restore
+      // them afterwards.
+      openvdb::CoordBBox bbox = m_vdb_grid->evalActiveVoxelBoundingBox();
+
+      std::vector<std::pair<openvdb::Coord, float> > active_voxels;
+      active_voxels.reserve(m_vdb_grid->activeVoxelCount());
+      for (auto iter = m_vdb_grid->cbeginValueOn(); iter; ++iter)
       {
-        for (int y = bbox.min().y(); y <= bbox.max().y(); ++y)
-        {
-          for (int z = bbox.min().z(); z <= bbox.max().z(); ++z)
-          {
-            openvdb::Coord index_coord = openvdb::Coord(x, y, z);
-            if (!acc.isValueOn(index_coord))
-            {
-              acc.setValueOff(index_coord, m_min_logodds);
-            }
-          }
-        }
+        active_voxels.emplace_back(iter.getCoord(), iter.getValue());
+      }
+
+      m_vdb_grid->sparseFill(bbox, m_min_logodds, false);
+
+      for (const auto& [coord, value] : active_voxels)
+      {
+        acc.setValueOn(coord, value);
       }
     }
 
     m_vdb_grid->pruneGrid();
+    return true;
   }
 
   /*!

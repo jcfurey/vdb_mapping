@@ -1,7 +1,7 @@
 #include "gtest/gtest.h"
 #include <array>
-#include <vector>
 #include <vdb_mapping/OccupancyVDBMapping.hpp>
+#include <vector>
 
 namespace vdb_mapping {
 
@@ -182,7 +182,7 @@ TEST(Mapping, InvalidConfigRejected)
   EXPECT_EQ(acc.getValue(openvdb::Coord(0, 0, 1)), log_hit);
 
   // Attempt to apply invalid config (prob_miss > 0.5) - should be rejected
-  Config bad_conf  = conf;
+  Config bad_conf    = conf;
   bad_conf.prob_miss = 0.8;
   map.setConfig(bad_conf);
 
@@ -243,8 +243,7 @@ TEST(Mapping, DestructWithoutConfig)
 namespace {
 // Builds a fast-mode map and inserts the given obstacle points so that the
 // volume ray intersectors are initialized for raytrace queries.
-void setupFastModeMap(OccupancyVDBMapping& map,
-                      const std::vector<std::array<float, 3> >& obstacles)
+void setupFastModeMap(OccupancyVDBMapping& map, const std::vector<std::array<float, 3> >& obstacles)
 {
   Config conf;
   conf.max_range      = 50;
@@ -359,15 +358,85 @@ TEST(Mapping, ByteArrayToGridRejectsGarbage)
 {
   OccupancyVDBMapping map(1);
   std::vector<uint8_t> garbage = {0xde, 0xad, 0xbe, 0xef, 0x42};
-  auto grid = map.byteArrayToGrid<OccupancyVDBMapping::GridT>(garbage);
+  auto grid                    = map.byteArrayToGrid<OccupancyVDBMapping::GridT>(garbage);
   EXPECT_EQ(grid, nullptr);
+}
+
+TEST(Mapping, LogCallbackCapturesMessages)
+{
+  std::vector<std::pair<OccupancyVDBMapping::LogLevel, std::string> > messages;
+  OccupancyVDBMapping map(1);
+  map.setLogCallback([&](OccupancyVDBMapping::LogLevel level, const std::string& msg) {
+    messages.emplace_back(level, msg);
+  });
+
+  // Invalid config must be reported through the callback, not stderr
+  Config bad_conf;
+  bad_conf.prob_miss = 0.8;
+  map.setConfig(bad_conf);
+
+  ASSERT_EQ(messages.size(), 1u);
+  EXPECT_EQ(messages[0].first, OccupancyVDBMapping::LogLevel::Error);
+  EXPECT_NE(messages[0].second.find("Probability for a miss"), std::string::npos);
+
+  // Unknown source warning also goes through the callback
+  OccupancyVDBMapping::PointCloudT::Ptr cloud(new OccupancyVDBMapping::PointCloudT);
+  Eigen::Matrix<double, 3, 1> origin(0, 0, 0);
+  map.accumulateUpdate(cloud, origin, "unknown_source");
+  ASSERT_EQ(messages.size(), 2u);
+  EXPECT_EQ(messages[1].first, OccupancyVDBMapping::LogLevel::Warning);
+}
+
+TEST(Mapping, CreateMapFromPCDSetsBackground)
+{
+  double resolution = 0.1;
+  Config conf;
+  conf.max_range      = 10;
+  conf.fast_mode      = false;
+  conf.prob_hit       = 0.9;
+  conf.prob_miss      = 0.1;
+  conf.prob_thres_max = 0.51;
+  conf.prob_thres_min = 0.49;
+
+  auto max_logodds = static_cast<float>(log(0.99) - log(0.01));
+  auto min_logodds = static_cast<float>(log(0.01) - log(0.99));
+
+  // Two occupied corners spanning a box of unknown space in between
+  OccupancyVDBMapping::PointCloudT::Ptr cloud(new OccupancyVDBMapping::PointCloudT);
+  cloud->points.emplace_back(0.0f, 0.0f, 0.0f);
+  cloud->points.emplace_back(2.0f, 2.0f, 2.0f);
+  cloud->width         = cloud->points.size();
+  cloud->height        = 1;
+  std::string pcd_path = testing::TempDir() + "vdb_mapping_test_cloud.pcd";
+  ASSERT_EQ(pcl::io::savePCDFile(pcd_path, *cloud), 0);
+
+  // Loading into an unconfigured map must fail instead of writing garbage
+  {
+    OccupancyVDBMapping map(resolution);
+    EXPECT_FALSE(map.loadMapFromPCD(pcd_path, true, true));
+  }
+
+  OccupancyVDBMapping map(resolution);
+  map.setConfig(conf);
+  EXPECT_TRUE(map.loadMapFromPCD(pcd_path, true, true));
+
+  OccupancyVDBMapping::GridT::Accessor acc = map.getGrid()->getAccessor();
+  // Occupied voxels keep the max log odds and stay active
+  EXPECT_FLOAT_EQ(acc.getValue(openvdb::Coord(0, 0, 0)), max_logodds);
+  EXPECT_TRUE(acc.isValueOn(openvdb::Coord(0, 0, 0)));
+  EXPECT_FLOAT_EQ(acc.getValue(openvdb::Coord(20, 20, 20)), max_logodds);
+  // Background voxels inside the bounding box read as free space, inactive
+  EXPECT_FLOAT_EQ(acc.getValue(openvdb::Coord(10, 10, 10)), min_logodds);
+  EXPECT_FALSE(acc.isValueOn(openvdb::Coord(10, 10, 10)));
+  // Voxels outside the bounding box stay unknown
+  EXPECT_FLOAT_EQ(acc.getValue(openvdb::Coord(50, 50, 50)), 0.0f);
 }
 
 TEST(Mapping, MorphologicalDilateErode)
 {
   OccupancyVDBMapping map(1);
 
-  OccupancyVDBMapping::UpdateGridT::Ptr grid = OccupancyVDBMapping::UpdateGridT::create(false);
+  OccupancyVDBMapping::UpdateGridT::Ptr grid     = OccupancyVDBMapping::UpdateGridT::create(false);
   OccupancyVDBMapping::UpdateGridT::Accessor acc = grid->getAccessor();
   acc.setValueOn(openvdb::Coord(0, 0, 0), true);
   EXPECT_EQ(grid->activeVoxelCount(), 1u);

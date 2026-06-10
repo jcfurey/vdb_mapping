@@ -40,9 +40,11 @@
 #include <cmath>
 #include <condition_variable>
 #include <eigen3/Eigen/Geometry>
+#include <functional>
 #include <iostream>
 #include <optional>
 #include <shared_mutex>
+#include <sstream>
 #include <thread>
 #include <type_traits>
 
@@ -104,6 +106,36 @@ public:
     std::chrono::milliseconds max_input_period;
     std::condition_variable data_available_cv;
   };
+
+  /*!
+   * \brief Severity of a library log message
+   */
+  enum class LogLevel
+  {
+    Info,
+    Warning,
+    Error
+  };
+
+  /*!
+   * \brief Callback type for routing library log messages into a host
+   * logging framework (e.g. rclcpp logging)
+   */
+  using LogCallbackT = std::function<void(LogLevel, const std::string&)>;
+
+  /*!
+   * \brief Routes all library log output through the given callback instead
+   * of stdout/stderr. Pass an empty callback to restore the default
+   * behavior. The callback is invoked from the calling thread, including the
+   * internal worker threads, but never concurrently.
+   *
+   * \param callback Log callback
+   */
+  void setLogCallback(LogCallbackT callback)
+  {
+    std::lock_guard<std::mutex> lock(m_log_mutex);
+    m_log_callback = std::move(callback);
+  }
 
   VDBMapping()                  = delete;
   VDBMapping(const VDBMapping&) = delete;
@@ -230,7 +262,7 @@ public:
   bool saveMap() const
   {
     std::string map_name = timestampedMapPath("_map.vdb");
-    std::cout << map_name << std::endl;
+    logMessage(LogLevel::Info, "Saving map to " + map_name);
     try
     {
       openvdb::io::File file_handle(map_name);
@@ -242,7 +274,7 @@ public:
     }
     catch (const std::exception& e)
     {
-      std::cerr << "Could not save map to " << map_name << ": " << e.what() << std::endl;
+      logMessage(LogLevel::Error, "Could not save map to " + map_name + ": " + e.what());
       return false;
     }
     return true;
@@ -283,10 +315,10 @@ public:
 
     if (pcl::io::savePCDFile(pcd_path, *cloud) != 0)
     {
-      PCL_ERROR("Could not write PCD file.");
+      logMessage(LogLevel::Error, "Could not write PCD file to " + pcd_path);
       return false;
     }
-    std::cout << "Wrote pcd to: " << pcd_path << std::endl;
+    logMessage(LogLevel::Info, "Wrote pcd to: " + pcd_path);
     return true;
   }
 
@@ -312,20 +344,21 @@ public:
         {
           break;
         }
-        std::cerr << "Skipping grid '" << name_iter.gridName()
-                  << "': not compatible with this map's grid type" << std::endl;
+        logMessage(LogLevel::Warning,
+                   "Skipping grid '" + name_iter.gridName() +
+                     "': not compatible with this map's grid type");
       }
       file_handle.close();
     }
     catch (const std::exception& e)
     {
-      std::cerr << "Could not load map from " << file_path << ": " << e.what() << std::endl;
+      logMessage(LogLevel::Error, "Could not load map from " + file_path + ": " + e.what());
       return false;
     }
 
     if (!loaded_grid)
     {
-      std::cerr << "File " << file_path << " contains no compatible grid" << std::endl;
+      logMessage(LogLevel::Error, "File " + file_path + " contains no compatible grid");
       return false;
     }
 
@@ -337,9 +370,10 @@ public:
     const openvdb::Vec3d voxel_size = m_vdb_grid->voxelSize();
     if (std::abs(voxel_size.x() - m_resolution) > 1e-9)
     {
-      std::cerr << "Loaded map resolution " << voxel_size.x()
-                << " differs from configured resolution " << m_resolution
-                << ". Adopting the loaded resolution." << std::endl;
+      std::ostringstream msg;
+      msg << "Loaded map resolution " << voxel_size.x() << " differs from configured resolution "
+          << m_resolution << ". Adopting the loaded resolution.";
+      logMessage(LogLevel::Warning, msg.str());
       m_resolution = voxel_size.x();
     }
     return true;
@@ -359,13 +393,11 @@ public:
     PointCloudT::Ptr cloud(new PointCloudT);
     if (pcl::io::loadPCDFile<PointT>(file_path, *cloud) == -1)
     {
-      PCL_ERROR("Could not open PCD file");
+      logMessage(LogLevel::Error, "Could not open PCD file " + file_path);
       return false;
     }
     std::unique_lock map_lock(*m_map_mutex);
-    createMapFromPointCloud(cloud, set_background, clear_map);
-    map_lock.unlock();
-    return true;
+    return createMapFromPointCloud(cloud, set_background, clear_map);
   }
 
   /*!
@@ -385,8 +417,8 @@ public:
     auto source = m_input_sources.find(source_id);
     if (source == m_input_sources.end())
     {
-      std::cout << "Tried to accumulate update for " << source_id << ". Source not available"
-                << std::endl;
+      logMessage(LogLevel::Warning,
+                 "Tried to accumulate update for " + source_id + ". Source not available");
       return;
     }
     std::unique_lock update_grid_lock(source->second->update_grid_mutex);
@@ -427,8 +459,8 @@ public:
     auto source = m_input_sources.find(source_id);
     if (source == m_input_sources.end())
     {
-      std::cout << "Tried to add data for accumulation of " << source_id << ". Source not available"
-                << std::endl;
+      logMessage(LogLevel::Warning,
+                 "Tried to add data for accumulation of " + source_id + ". Source not available");
       return;
     }
 
@@ -549,7 +581,7 @@ public:
     // Check if a valid configuration was loaded
     if (!m_config_set)
     {
-      std::cerr << "Map not properly configured. Did you call setConfig method?" << std::endl;
+      logMessage(LogLevel::Error, "Map not properly configured. Did you call setConfig method?");
       return false;
     }
 
@@ -560,7 +592,7 @@ public:
     if (std::isnan(ray_origin_world.x()) || std::isnan(ray_origin_world.y()) ||
         std::isnan(ray_origin_world.z()))
     {
-      std::cerr << "Ray origin contains NaN values" << std::endl;
+      logMessage(LogLevel::Error, "Ray origin contains NaN values");
       return false;
     }
 
@@ -751,9 +783,9 @@ public:
 
     if (!m_volume_ray_intersector)
     {
-      std::cerr << "Volume ray intersector not initialized. "
-                << "Ensure fast_mode is enabled and point cloud data has been inserted."
-                << std::endl;
+      logMessage(LogLevel::Error,
+                 "Volume ray intersector not initialized. "
+                 "Ensure fast_mode is enabled and point cloud data has been inserted.");
       successes.assign(ray_origins_world.size(), false);
       end_points.resize(ray_origins_world.size());
       return;
@@ -1180,8 +1212,8 @@ public:
       buffer      = section->worldToIndex(buffer);
       // Round to the nearest voxel like worldToIndex; a plain int cast
       // truncates toward zero and is off by one for negative coordinates
-      openvdb::Coord coord = openvdb::Coord::floor(
-        openvdb::Vec3d(buffer.x() + 0.5, buffer.y() + 0.5, buffer.z() + 0.5));
+      openvdb::Coord coord =
+        openvdb::Coord::floor(openvdb::Vec3d(buffer.x() + 0.5, buffer.y() + 0.5, buffer.z() + 0.5));
       if (section_acc.isValueOn(coord))
       {
         acc.setValueOn(coord, section_acc.getValue(coord));
@@ -1261,9 +1293,9 @@ public:
       buffer      = section->worldToIndex(buffer);
       // Round to the nearest voxel like worldToIndex; a plain int cast
       // truncates toward zero and is off by one for negative coordinates
-      acc.setActiveState(openvdb::Coord::floor(openvdb::Vec3d(
-                           buffer.x() + 0.5, buffer.y() + 0.5, buffer.z() + 0.5)),
-                         true);
+      acc.setActiveState(
+        openvdb::Coord::floor(openvdb::Vec3d(buffer.x() + 0.5, buffer.y() + 0.5, buffer.z() + 0.5)),
+        true);
     }
     map_lock.unlock();
   }
@@ -1410,8 +1442,6 @@ protected:
   }
 
 public:
-
-
   /*!
    * \brief Compresses a string as a byte array
    *
@@ -1435,8 +1465,9 @@ public:
 
     if (ZSTD_isError(ret))
     {
-      std::cerr << "Compression using ZSTD failed: " << ZSTD_getErrorName(ret)
-                << " , sending uncompressed byte array" << std::endl;
+      logMessage(LogLevel::Error,
+                 std::string("Compression using ZSTD failed: ") + ZSTD_getErrorName(ret) +
+                   " , sending uncompressed byte array");
       return uncompressed;
     }
 
@@ -1465,8 +1496,9 @@ public:
     std::string map_str;
     if (frame_len == ZSTD_CONTENTSIZE_ERROR || frame_len == ZSTD_CONTENTSIZE_UNKNOWN)
     {
-      std::cerr << "Could not determine decompressed size (frame not zstd or missing "
-                   "size header); returning raw data" << std::endl;
+      logMessage(LogLevel::Error,
+                 "Could not determine decompressed size (frame not zstd or missing "
+                 "size header); returning raw data");
       return std::string(byte_array.begin(), byte_array.end());
     }
 
@@ -1478,8 +1510,9 @@ public:
 
     if (ZSTD_isError(size))
     {
-      std::cerr << "Could not decompress map using ZSTD failed: " << ZSTD_getErrorName(size)
-                << " , returning raw data" << std::endl;
+      logMessage(LogLevel::Error,
+                 std::string("Could not decompress map using ZSTD failed: ") +
+                   ZSTD_getErrorName(size) + " , returning raw data");
       map_str = std::string(byte_array.begin(), byte_array.end());
     }
     else
@@ -1526,7 +1559,7 @@ public:
       openvdb::GridPtrVecPtr grids = strm.getGrids();
       if (!grids || grids->empty())
       {
-        std::cerr << "Byte array contains no grids" << std::endl;
+        logMessage(LogLevel::Error, "Byte array contains no grids");
         return nullptr;
       }
       // This cast might fail if different VDB versions are used.
@@ -1535,7 +1568,7 @@ public:
     }
     catch (const std::exception& e)
     {
-      std::cerr << "Could not parse grid from byte array: " << e.what() << std::endl;
+      logMessage(LogLevel::Error, std::string("Could not parse grid from byte array: ") + e.what());
       return nullptr;
     }
   }
@@ -1579,7 +1612,7 @@ public:
       std::unique_lock map_lock(*m_map_mutex);
       if (m_input_sources.find(source_id) != m_input_sources.end())
       {
-        std::cerr << "Input source " << source_id << " already registered" << std::endl;
+        logMessage(LogLevel::Warning, "Input source " + source_id + " already registered");
         return;
       }
       m_input_sources[s->source_id] = s;
@@ -1613,8 +1646,8 @@ public:
     {
       auto sleep_time = std::chrono::high_resolution_clock::now() + source->max_input_period;
       std::unique_lock lock(source->input_data_mutex);
-      source->data_available_cv.wait(
-        lock, [&] { return source->input_data || m_thread_stop_signal; });
+      source->data_available_cv.wait(lock,
+                                     [&] { return source->input_data || m_thread_stop_signal; });
       if (m_thread_stop_signal)
       {
         break;
@@ -1634,7 +1667,7 @@ public:
       accumulateUpdate(measurement.first, measurement.second, source_id);
       sleepUntilOrStop(sleep_time);
     }
-    std::cout << "Thread for source " << source_id << " received stop signal." << std::endl;
+    logMessage(LogLevel::Info, "Thread for source " + source_id + " received stop signal.");
   }
 
   /*!
@@ -1653,7 +1686,7 @@ public:
       integrateUpdate();
       sleepUntilOrStop(sleeping_time);
     }
-    std::cout << "Integration thread received stop signal" << std::endl;
+    logMessage(LogLevel::Info, "Integration thread received stop signal");
   }
 
   /*!
@@ -1698,8 +1731,9 @@ public:
   {
     if (config.max_range < 0.0)
     {
-      std::cerr << "Max range of " << config.max_range << " invalid. Range cannot be negative."
-                << std::endl;
+      logMessage(LogLevel::Error,
+                 "Max range of " + std::to_string(config.max_range) +
+                   " invalid. Range cannot be negative.");
       return;
     }
     if (!(config.accumulation_period > 0.0))
@@ -1707,8 +1741,9 @@ public:
       // Without this guard, a zero or negative period silently casts to 0 ms
       // (busy-spin) or wraps to a huge unsigned sleep duration on the
       // integration thread.
-      std::cerr << "Accumulation period of " << config.accumulation_period
-                << " invalid. Must be a positive number of seconds." << std::endl;
+      logMessage(LogLevel::Error,
+                 "Accumulation period of " + std::to_string(config.accumulation_period) +
+                   " invalid. Must be a positive number of seconds.");
       return;
     }
     m_max_range           = config.max_range;
@@ -1719,26 +1754,63 @@ public:
   }
 
 protected:
+  /*!
+   * \brief Emits a log message through the configured callback, falling back
+   * to stdout (Info) / stderr (Warning, Error) when no callback is set
+   *
+   * \param level Message severity
+   * \param message Message text
+   */
+  void logMessage(const LogLevel level, const std::string& message) const
+  {
+    std::lock_guard<std::mutex> lock(m_log_mutex);
+    if (m_log_callback)
+    {
+      m_log_callback(level, message);
+      return;
+    }
+    if (level == LogLevel::Info)
+    {
+      std::cout << message << std::endl;
+    }
+    else
+    {
+      std::cerr << message << std::endl;
+    }
+  }
+
   // Default no-op implementations — OccupancyVDBMapping (and any other
   // subclass) overrides these with concrete log-odds behaviour. The params
   // are named for documentation / IDE completion; [[maybe_unused]] silences
   // -Wunused-parameter for the default bodies without removing the names.
-  virtual bool updateFreeNode([[maybe_unused]] TData& voxel_value,
-                              [[maybe_unused]] bool& active) { return false; }
+  virtual bool updateFreeNode([[maybe_unused]] TData& voxel_value, [[maybe_unused]] bool& active)
+  {
+    return false;
+  }
   virtual bool updateOccupiedNode([[maybe_unused]] TData& voxel_value,
-                                  [[maybe_unused]] bool& active) { return false; }
-  virtual bool setNodeToFree([[maybe_unused]] TData& voxel_value,
-                             [[maybe_unused]] bool& active) { return false; }
-  virtual bool setNodeToOccupied([[maybe_unused]] TData& voxel_value,
-                                 [[maybe_unused]] bool& active) { return false; }
-  virtual bool setNodeState([[maybe_unused]] TData& voxel_value,
-                            [[maybe_unused]] bool& active) { return false; }
+                                  [[maybe_unused]] bool& active)
+  {
+    return false;
+  }
+  virtual bool setNodeToFree([[maybe_unused]] TData& voxel_value, [[maybe_unused]] bool& active)
+  {
+    return false;
+  }
+  virtual bool setNodeToOccupied([[maybe_unused]] TData& voxel_value, [[maybe_unused]] bool& active)
+  {
+    return false;
+  }
+  virtual bool setNodeState([[maybe_unused]] TData& voxel_value, [[maybe_unused]] bool& active)
+  {
+    return false;
+  }
 
-  virtual void createMapFromPointCloud([[maybe_unused]] const PointCloudT::Ptr& cloud,
+  virtual bool createMapFromPointCloud([[maybe_unused]] const PointCloudT::Ptr& cloud,
                                        [[maybe_unused]] const bool set_background,
                                        [[maybe_unused]] const bool clear_map)
   {
-    std::cerr << "Not implemented for data type" << std::endl;
+    logMessage(LogLevel::Error, "Not implemented for data type");
+    return false;
   }
 
   /*!
@@ -1795,6 +1867,16 @@ protected:
    * \brief Specifies whether artificial areas are present
    */
   bool m_artificial_areas_present;
+
+  /*!
+   * \brief Optional log callback; when unset, messages go to stdout/stderr
+   */
+  LogCallbackT m_log_callback;
+
+  /*!
+   * \brief Serializes log callback invocation and replacement
+   */
+  mutable std::mutex m_log_mutex;
 
   /*!
    * \brief Map mutex for the map grid
