@@ -23,7 +23,11 @@ The library requires the following dependencies to build correctly
 apt-get install -y libeigen3-dev
 apt-get install -y libtbb-dev
 apt-get install -y libpcl-dev
-apt-get install -y libilmbase-dev
+apt-get install -y libzstd-dev
+# Ubuntu 22.04 and newer (OpenVDB >= 9):
+apt-get install -y libimath-dev
+# Ubuntu 20.04 (older OpenVDB builds against IlmBase):
+# apt-get install -y libilmbase-dev
 ```
 
 #### Plain cmake
@@ -111,7 +115,7 @@ or for the remote mapping case:
   booktitle={Robotics in Natural Settings: CLAWAR 2022},
   pages={448--459},
   year={2022},
-  publisher={Springer}
+  publisher={Springer},
   doi={10.1007/978-3-031-15226-9_42}
 }
 ```

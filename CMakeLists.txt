@@ -3,7 +3,7 @@ set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules" ${CMAKE_MODULE_
 
 option(BUILDING_TESTS "Build unit tests." ON)
 
-project(vdb_mapping CXX C)
+project(vdb_mapping VERSION 0.1.0 LANGUAGES CXX C)
 
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
   message("${PROJECT_NAME}: You did not request a specific build type: selecting 'Release'.")
@@ -27,21 +27,22 @@ add_library(${PROJECT_NAME} INTERFACE)
 
 ### Declare a C++ library
 target_include_directories(${PROJECT_NAME}
-  INTERFACE 
+  INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
-    ${EIGEN3_INCLUDE_DIR}
     ${PCL_INCLUDE_DIRS}
     ${ZSTD_INCLUDE_DIRS}
     )
 
+# Imath/Half is linked transitively through OpenVDB::openvdb (see
+# FindOpenVDB.cmake's OpenVDB_USES_IMATH_HALF handling); hardcoding -lImath
+# here breaks systems where the library name differs.
 target_link_libraries(${PROJECT_NAME}
   INTERFACE
     OpenVDB::openvdb
-    ${EIGEN3_LIBRARIES}
+    Eigen3::Eigen
     ${PCL_LIBRARIES}
     ${ZSTD_LIBRARIES}
-    -lImath
     )
 
 target_compile_features(${PROJECT_NAME} INTERFACE cxx_std_17)
@@ -87,7 +88,7 @@ install(
  )
 
 include(CMakePackageConfigHelpers)
-write_basic_package_version_file(${PROJECT_NAME}ConfigVersion.cmake VERSION 1.0.0
+write_basic_package_version_file(${PROJECT_NAME}ConfigVersion.cmake VERSION ${PROJECT_VERSION}
   COMPATIBILITY SameMajorVersion)
 install(
   FILES
@@ -95,6 +96,7 @@ install(
     CMakeModules/FindOpenVDB.cmake
     CMakeModules/OpenVDBUtils.cmake
     CMakeModules/FindBlosc.cmake
+    CMakeModules/FindZSTD.cmake
   DESTINATION
     lib/cmake/${PROJECT_NAME}
   )
