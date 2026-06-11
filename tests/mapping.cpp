@@ -432,6 +432,123 @@ TEST(Mapping, CreateMapFromPCDSetsBackground)
   EXPECT_FLOAT_EQ(acc.getValue(openvdb::Coord(50, 50, 50)), 0.0f);
 }
 
+TEST(Mapping, ConfigurableClampingBounds)
+{
+  // The log-odds clamping bounds (OctoMap Eq. 4) are configurable; repeated
+  // hits must saturate at the configured clamp, not at the former hardcoded
+  // logit(0.99).
+  OccupancyVDBMapping map(1);
+  Config conf;
+  conf.max_range      = 10;
+  conf.fast_mode      = false;
+  conf.prob_hit       = 0.9;
+  conf.prob_miss      = 0.1;
+  conf.prob_thres_max = 0.51;
+  conf.prob_thres_min = 0.49;
+  conf.prob_clamp_min = 0.2;
+  conf.prob_clamp_max = 0.8;
+  map.setConfig(conf);
+  map.addInputSource("test", conf.max_range, 0);
+
+  auto clamp_max = static_cast<float>(log(conf.prob_clamp_max) - log(1 - conf.prob_clamp_max));
+  auto clamp_min = static_cast<float>(log(conf.prob_clamp_min) - log(1 - conf.prob_clamp_min));
+
+  OccupancyVDBMapping::PointCloudT::Ptr cloud(new OccupancyVDBMapping::PointCloudT);
+  cloud->points.emplace_back(0, 0, 5);
+  Eigen::Matrix<double, 3, 1> origin(0, 0, 0);
+  for (int i = 0; i < 10; ++i)
+  {
+    map.insertPointCloud(cloud, origin, "test");
+  }
+  OccupancyVDBMapping::GridT::Accessor acc = map.getGrid()->getAccessor();
+  EXPECT_FLOAT_EQ(acc.getValue(openvdb::Coord(0, 0, 5)), clamp_max);
+  EXPECT_FLOAT_EQ(acc.getValue(openvdb::Coord(0, 0, 1)), clamp_min);
+
+  // Clamps that do not enclose the activation thresholds must be rejected
+  Config bad_conf         = conf;
+  bad_conf.prob_clamp_max = 0.5; // below prob_thres_max
+  std::vector<std::string> errors;
+  map.setLogCallback([&](OccupancyVDBMapping::LogLevel level, const std::string& msg) {
+    if (level == OccupancyVDBMapping::LogLevel::Error)
+    {
+      errors.push_back(msg);
+    }
+  });
+  map.setConfig(bad_conf);
+  EXPECT_EQ(errors.size(), 1u);
+}
+
+TEST(Mapping, MapResetInvalidatesIntersectors)
+{
+  // VolumeRayIntersector references the grid it was built from without
+  // keeping it alive; resetting the map must drop the intersectors instead
+  // of leaving them pointing at the replaced grid.
+  double resolution = 0.1;
+  OccupancyVDBMapping map(resolution);
+  setupFastModeMap(map, {{20.0f, 0.0f, 0.0f}});
+
+  bool success;
+  openvdb::Vec3d end_point;
+  map.raytrace(openvdb::Vec3d(0, 0, 0), openvdb::Vec3d(1, 0, 0), 30.0, success, end_point);
+  EXPECT_TRUE(success);
+
+  map.resetMap();
+  map.raytrace(openvdb::Vec3d(0, 0, 0), openvdb::Vec3d(1, 0, 0), 30.0, success, end_point);
+  EXPECT_FALSE(success);
+
+  // The map must come back to life after new data is inserted
+  OccupancyVDBMapping::PointCloudT::Ptr obstacles(new OccupancyVDBMapping::PointCloudT);
+  obstacles->points.emplace_back(20.0f, 0.0f, 0.0f);
+  map.addPointsToGrid(obstacles);
+  OccupancyVDBMapping::PointCloudT::Ptr empty_cloud(new OccupancyVDBMapping::PointCloudT);
+  Eigen::Matrix<double, 3, 1> origin(0, 0, 0);
+  map.insertPointCloud(empty_cloud, origin, "test");
+  map.raytrace(openvdb::Vec3d(0, 0, 0), openvdb::Vec3d(1, 0, 0), 30.0, success, end_point);
+  EXPECT_TRUE(success);
+  EXPECT_NEAR(end_point.x(), 20.0, resolution);
+}
+
+TEST(Mapping, IntegrationPrunesUniformLeaves)
+{
+  // Stable uniform regions must collapse into tiles after integration
+  // (clamping + pruning compression, OctoMap Sect. 3.4)
+  OccupancyVDBMapping map(1);
+  Config conf;
+  conf.max_range      = 100;
+  conf.fast_mode      = false;
+  conf.prob_hit       = 0.9;
+  conf.prob_miss      = 0.1;
+  conf.prob_thres_max = 0.51;
+  conf.prob_thres_min = 0.49;
+  map.setConfig(conf);
+  map.addInputSource("test", conf.max_range, 0);
+
+  // Fill one complete 8^3 leaf with saturated occupied voxels
+  OccupancyVDBMapping::PointCloudT::Ptr block(new OccupancyVDBMapping::PointCloudT);
+  for (int x = 0; x < 8; ++x)
+  {
+    for (int y = 0; y < 8; ++y)
+    {
+      for (int z = 0; z < 8; ++z)
+      {
+        block->points.emplace_back(
+          static_cast<float>(x + 64), static_cast<float>(y), static_cast<float>(z));
+      }
+    }
+  }
+  map.addPointsToGrid(block);
+  EXPECT_GE(map.getGrid()->tree().leafCount(), 1u);
+
+  // Trigger an integration cycle, which prunes the grid
+  OccupancyVDBMapping::PointCloudT::Ptr empty_cloud(new OccupancyVDBMapping::PointCloudT);
+  Eigen::Matrix<double, 3, 1> origin(0, 0, 0);
+  map.insertPointCloud(empty_cloud, origin, "test");
+
+  // The uniform leaf is now a tile; the voxels are still active
+  EXPECT_EQ(map.getGrid()->tree().leafCount(), 0u);
+  EXPECT_EQ(map.getGrid()->activeVoxelCount(), 512u);
+}
+
 TEST(Mapping, MorphologicalDilateErode)
 {
   OccupancyVDBMapping map(1);

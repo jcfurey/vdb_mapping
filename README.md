@@ -115,7 +115,7 @@ or for the remote mapping case:
   booktitle={Robotics in Natural Settings: CLAWAR 2022},
   pages={448--459},
   year={2022},
-  publisher={Springer}
+  publisher={Springer},
   doi={10.1007/978-3-031-15226-9_42}
 }
 ```

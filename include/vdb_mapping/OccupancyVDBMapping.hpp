@@ -34,6 +34,10 @@ namespace vdb_mapping {
 
 /*!
  * \brief Accumulation of configuration parameters
+ *
+ * The defaults follow the beam-based inverse sensor model parameters
+ * published for OctoMap (Hornung et al., Auton. Robots 2013, Sect. 5.1):
+ * P(hit) = 0.7, P(miss) = 0.4, with activation thresholds at 0.12 / 0.97.
  */
 struct Config : BaseConfig
 {
@@ -41,6 +45,14 @@ struct Config : BaseConfig
   double prob_miss      = 0.4;
   double prob_thres_min = 0.12;
   double prob_thres_max = 0.97;
+  /*!
+   * \brief Clamping bounds of the log-odds update (Yguel et al.'s clamping
+   * update policy, see OctoMap Eq. 4). Tighter bounds let the map adapt to
+   * changes faster and improve pruning compression, at the cost of map
+   * confidence; wider bounds behave closer to an unbounded estimator.
+   */
+  double prob_clamp_min = 0.01;
+  double prob_clamp_max = 0.99;
 };
 
 class OccupancyVDBMapping : public VDBMapping<float, Config>
@@ -84,6 +96,18 @@ public:
                    " max=" + std::to_string(config.prob_thres_max));
       return;
     }
+    // The clamps must enclose the activation thresholds: otherwise a voxel
+    // saturates before it can ever cross a threshold and the map freezes.
+    if (!(config.prob_clamp_min > 0.0 && config.prob_clamp_min <= config.prob_thres_min &&
+          config.prob_clamp_max < 1.0 && config.prob_clamp_max >= config.prob_thres_max))
+    {
+      logMessage(LogLevel::Error,
+                 "Clamping bounds must satisfy 0 < clamp_min <= thres_min and thres_max <= "
+                 "clamp_max < 1 but are clamp_min=" +
+                   std::to_string(config.prob_clamp_min) +
+                   " clamp_max=" + std::to_string(config.prob_clamp_max));
+      return;
+    }
 
     // call base class function after validation passes
     VDBMapping::setConfig(config);
@@ -95,35 +119,40 @@ public:
       static_cast<float>(log(config.prob_thres_min) - log(1 - config.prob_thres_min));
     m_logodds_thres_max =
       static_cast<float>(log(config.prob_thres_max) - log(1 - config.prob_thres_max));
-    // Values to clamp the logodds in order to prevent non dynamic map behavior
-    m_max_logodds = static_cast<float>(log(0.99) - log(0.01));
-    m_min_logodds = static_cast<float>(log(0.01) - log(0.99));
+    // Clamping update policy bounds (OctoMap Eq. 4): keep the log odds
+    // bounded so the map stays adaptive to changes in the environment
+    m_max_logodds = static_cast<float>(log(config.prob_clamp_max) - log(1 - config.prob_clamp_max));
+    m_min_logodds = static_cast<float>(log(config.prob_clamp_min) - log(1 - config.prob_clamp_min));
   }
 
 protected:
+  // Clamping update policy, L = max(min(L + l, l_max), l_min) (OctoMap
+  // Eq. 4): the clamp applies on every update so the confidence stays
+  // bounded; the activation thresholds then switch the voxel state with
+  // hysteresis.
   inline bool updateFreeNode(float& voxel_value, bool& active) override
   {
     voxel_value += m_logodds_miss;
+    if (voxel_value < m_min_logodds)
+    {
+      voxel_value = m_min_logodds;
+    }
     if (voxel_value < m_logodds_thres_min)
     {
       active = false;
-      if (voxel_value < m_min_logodds)
-      {
-        voxel_value = m_min_logodds;
-      }
     }
     return true;
   }
   inline bool updateOccupiedNode(float& voxel_value, bool& active) override
   {
     voxel_value += m_logodds_hit;
+    if (voxel_value > m_max_logodds)
+    {
+      voxel_value = m_max_logodds;
+    }
     if (voxel_value > m_logodds_thres_max)
     {
       active = true;
-      if (voxel_value > m_max_logodds)
-      {
-        voxel_value = m_max_logodds;
-      }
     }
     return true;
   }

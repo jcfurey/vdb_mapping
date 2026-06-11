@@ -222,6 +222,10 @@ public:
     std::unique_lock map_lock(*m_map_mutex);
     m_vdb_grid->clear();
     m_vdb_grid = createVDBMap();
+    // The volume ray intersectors reference the replaced grid (they hold raw
+    // pointers and a topology copy, not shared ownership) and must not
+    // outlive it.
+    resetVolumeRayIntersectors();
 
     for (auto& [source_id, source] : m_input_sources)
     {
@@ -364,6 +368,10 @@ public:
 
     std::unique_lock map_lock(*m_map_mutex);
     m_vdb_grid = loaded_grid;
+    // The volume ray intersectors reference the replaced grid (they hold raw
+    // pointers and a topology copy, not shared ownership) and must not
+    // outlive it. They are rebuilt on the next integration cycle.
+    resetVolumeRayIntersectors();
     // Keep the index<->world math consistent with the loaded grid. Otherwise
     // a map saved at a different resolution silently corrupts every
     // worldToIndex computation afterwards.
@@ -487,6 +495,11 @@ public:
 
       source->update_grid = UpdateGridT::create(false);
     }
+    // The clamping update policy drives stable regions to uniform log-odds
+    // values, which is precisely what enables pruning to merge them into
+    // tiles (Hornung et al., "OctoMap", Auton. Robots 2013, Sect. 3.4).
+    // Without this the tree only ever grows.
+    m_vdb_grid->pruneGrid();
     updateVolumeRayIntersectors();
   }
 
@@ -1719,6 +1732,21 @@ public:
           std::make_shared<openvdb::tools::VolumeRayIntersector<openvdb::FloatGrid> >(
             *m_volume_ray_intersector);
       }
+    }
+  }
+
+  /*!
+   * \brief Drops all volume ray intersectors. Must be called whenever the
+   * map grid object is replaced, since intersectors reference the grid they
+   * were constructed from without keeping it alive.
+   * Expects the unique map lock to be held by the caller.
+   */
+  void resetVolumeRayIntersectors()
+  {
+    m_volume_ray_intersector.reset();
+    for (auto& [source_id, source] : m_input_sources)
+    {
+      source->volume_ray_intersector.reset();
     }
   }
 
