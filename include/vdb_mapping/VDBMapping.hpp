@@ -794,20 +794,20 @@ public:
   {
     std::shared_lock map_lock(*m_map_mutex);
 
-    if (!m_volume_ray_intersector)
-    {
-      logMessage(LogLevel::Error,
-                 "Volume ray intersector not initialized. "
-                 "Ensure fast_mode is enabled and point cloud data has been inserted.");
-      successes.assign(ray_origins_world.size(), false);
-      end_points.resize(ray_origins_world.size());
-      return;
-    }
-
+    // The volume ray intersector only exists in fast mode after an
+    // integration on a non-empty grid. When available it accelerates the
+    // query by restricting the fine DDA walk to leaf spans that contain
+    // active voxels; without it (fast_mode off, or nothing integrated yet)
+    // fall back to an exact DDA walk over the full ray instead of failing
+    // the query.
+    //
     // Shallow-copy the shared intersector so concurrent raytrace callers do
     // not race on setIndexRay/march, which both mutate intersector state.
-    openvdb::tools::VolumeRayIntersector<openvdb::FloatGrid> local_intersector(
-      *m_volume_ray_intersector);
+    std::optional<openvdb::tools::VolumeRayIntersector<openvdb::FloatGrid> > local_intersector;
+    if (m_volume_ray_intersector)
+    {
+      local_intersector.emplace(*m_volume_ray_intersector);
+    }
 
     typename GridT::Accessor acc = m_vdb_grid->getAccessor();
     successes.resize(ray_origins_world.size());
@@ -825,12 +825,35 @@ public:
       successes[i]  = false;
       end_points[i] = m_vdb_grid->indexToWorld(ray_origin_index + ray_direction_index);
 
+      if (!local_intersector)
+      {
+        // Exact DDA over the full ray. Voxels are cell-centered
+        // (worldToIndex rounds to the nearest lattice point) while the DDA
+        // cell convention is [i, i+1): shift by half a voxel so dda.voxel()
+        // yields cell-centered indices.
+        RayT ray(ray_origin_index + openvdb::Vec3d(0.5),
+                 ray_direction_index,
+                 openvdb::math::Delta<double>::value(),
+                 1);
+        DDAT dda(ray);
+        do
+        {
+          if (acc.isValueOn(dda.voxel()))
+          {
+            end_points[i] = m_vdb_grid->indexToWorld(dda.voxel());
+            successes[i]  = true;
+            break;
+          }
+        } while (dda.step());
+        continue;
+      }
+
       // Ray times must be strictly positive: a t0 of exactly 0 trips
       // Ray::setTimes' assertion inside the intersector when the origin lies
       // within an occupied leaf node.
       RayT ray(ray_origin_index, ray_direction_index, openvdb::math::Delta<double>::value(), 1);
 
-      if (!local_intersector.setIndexRay(ray))
+      if (!local_intersector->setIndexRay(ray))
       {
         // Ray misses the active bounding box of the map entirely
         continue;
@@ -841,7 +864,7 @@ public:
       // itself, so keep marching until a hit is found or the ray is exhausted.
       double t0;
       double t1;
-      while (!successes[i] && local_intersector.march(t0, t1))
+      while (!successes[i] && local_intersector->march(t0, t1))
       {
         RayT fine_ray(ray_origin_index, ray_direction_index, t0, t1);
         DDAT dda(fine_ray);

@@ -322,6 +322,51 @@ TEST(Mapping, RaytraceFromNearObstacle)
   EXPECT_FALSE(success);
 }
 
+TEST(Mapping, RaytraceWithoutFastMode)
+{
+  // raytrace used to require the volume ray intersector, which only exists
+  // in fast mode after an integration on a non-empty grid: with fast_mode
+  // off every query failed. Without an intersector the query now falls back
+  // to an exact DDA walk over the full ray.
+  double resolution = 0.1;
+  OccupancyVDBMapping map(resolution);
+  Config conf;
+  conf.max_range      = 50;
+  conf.fast_mode      = false;
+  conf.prob_hit       = 0.9;
+  conf.prob_miss      = 0.1;
+  conf.prob_thres_max = 0.51;
+  conf.prob_thres_min = 0.49;
+  map.setConfig(conf);
+
+  OccupancyVDBMapping::PointCloudT::Ptr obstacles(new OccupancyVDBMapping::PointCloudT);
+  obstacles->points.emplace_back(20.0f, 0.0f, 0.0f);
+  map.addPointsToGrid(obstacles);
+
+  bool success;
+  openvdb::Vec3d end_point;
+  map.raytrace(openvdb::Vec3d(0, 0, 0), openvdb::Vec3d(1, 0, 0), 30.0, success, end_point);
+  EXPECT_TRUE(success);
+  EXPECT_NEAR(end_point.x(), 20.0, resolution);
+  EXPECT_NEAR(end_point.y(), 0.0, resolution);
+  EXPECT_NEAR(end_point.z(), 0.0, resolution);
+
+  // A miss must report the max-range point with success == false
+  map.raytrace(openvdb::Vec3d(0, 0, 0), openvdb::Vec3d(-1, 0, 0), 5.0, success, end_point);
+  EXPECT_FALSE(success);
+  EXPECT_NEAR(end_point.x(), -5.0, resolution);
+
+  // Fast mode before the first integration has no intersector either and
+  // must take the same fallback instead of failing
+  OccupancyVDBMapping map_fast(resolution);
+  conf.fast_mode = true;
+  map_fast.setConfig(conf);
+  map_fast.addPointsToGrid(obstacles);
+  map_fast.raytrace(openvdb::Vec3d(0, 0, 0), openvdb::Vec3d(1, 0, 0), 30.0, success, end_point);
+  EXPECT_TRUE(success);
+  EXPECT_NEAR(end_point.x(), 20.0, resolution);
+}
+
 TEST(Mapping, MapSectionPreservesValues)
 {
   // Regression test: sparse map section extraction flattened all float voxel
