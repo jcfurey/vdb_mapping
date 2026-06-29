@@ -64,7 +64,7 @@ rosdep install --from-paths src --ignore-src -y
 catkin build
 
 # source the workspace
-source deve/setup.bash
+source devel/setup.bash
 
 ```
 

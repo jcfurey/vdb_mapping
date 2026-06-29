@@ -31,7 +31,7 @@ target_include_directories(${PROJECT_NAME}
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
     ${PCL_INCLUDE_DIRS}
-    ${ZSTD_INCLUDE_DIRS}
+    ${ZSTD_INCLUDE_DIR}
     )
 
 # Imath/Half is linked transitively through OpenVDB::openvdb (see
@@ -42,7 +42,7 @@ target_link_libraries(${PROJECT_NAME}
     OpenVDB::openvdb
     Eigen3::Eigen
     ${PCL_LIBRARIES}
-    ${ZSTD_LIBRARIES}
+    ${ZSTD_LIBRARY}
     )
 
 target_compile_features(${PROJECT_NAME} INTERFACE cxx_std_17)

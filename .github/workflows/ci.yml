@@ -1,0 +1,39 @@
+name: CI
+
+# The upstream .gitlab-ci.yml targets FZI's internal GitLab and is inert on
+# this GitHub fork. This workflow gives the fork a real build + test gate so
+# regressions (e.g. broken link flags or compiler-standard breaks) are caught.
+
+on:
+  push:
+    branches: [devel, 'claude/**']
+  pull_request:
+    branches: [devel]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake g++ \
+            libeigen3-dev \
+            libtbb-dev \
+            libpcl-dev \
+            libzstd-dev \
+            libopenvdb-dev \
+            libgtest-dev libgmock-dev
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILDING_TESTS=ON
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

@@ -96,13 +96,16 @@ public:
                    " max=" + std::to_string(config.prob_thres_max));
       return;
     }
-    // The clamps must enclose the activation thresholds: otherwise a voxel
-    // saturates before it can ever cross a threshold and the map freezes.
-    if (!(config.prob_clamp_min > 0.0 && config.prob_clamp_min <= config.prob_thres_min &&
-          config.prob_clamp_max < 1.0 && config.prob_clamp_max >= config.prob_thres_max))
+    // The clamps must strictly enclose the activation thresholds. The
+    // activation comparisons are strict (value > thres_max activates, value <
+    // thres_min deactivates), so a clamp equal to a threshold would let a voxel
+    // saturate exactly AT the threshold and never cross it: a saturated
+    // obstacle would stay inactive and the map would never show it.
+    if (!(config.prob_clamp_min > 0.0 && config.prob_clamp_min < config.prob_thres_min &&
+          config.prob_clamp_max < 1.0 && config.prob_clamp_max > config.prob_thres_max))
     {
       logMessage(LogLevel::Error,
-                 "Clamping bounds must satisfy 0 < clamp_min <= thres_min and thres_max <= "
+                 "Clamping bounds must satisfy 0 < clamp_min < thres_min and thres_max < "
                  "clamp_max < 1 but are clamp_min=" +
                    std::to_string(config.prob_clamp_min) +
                    " clamp_max=" + std::to_string(config.prob_clamp_max));
@@ -225,30 +228,34 @@ protected:
     return true;
   }
 
+  // In-class initializers (defense in depth): the setConfig guard in the
+  // mutators is the primary protection against using these before they are
+  // configured, but zero-initializing them avoids indeterminate values should
+  // any future code path read them early.
   /*!
    * \brief Probability update value for passing an obstacle
    */
-  float m_logodds_hit;
+  float m_logodds_hit = 0.0f;
   /*!
    * \brief Probability update value for passing free space
    */
-  float m_logodds_miss;
+  float m_logodds_miss = 0.0f;
   /*!
    * \brief Lower occupancy probability threshold below which a voxel is deactivated
    */
-  float m_logodds_thres_min;
+  float m_logodds_thres_min = 0.0f;
   /*!
    * \brief Upper occupancy probability threshold above which a voxel is activated
    */
-  float m_logodds_thres_max;
+  float m_logodds_thres_max = 0.0f;
   /*!
    * \brief Maximum clamping point for logodds
    */
-  float m_max_logodds;
+  float m_max_logodds = 0.0f;
   /*!
    * \brief Minimum clamping point for logodds
    */
-  float m_min_logodds;
+  float m_min_logodds = 0.0f;
 };
 
 

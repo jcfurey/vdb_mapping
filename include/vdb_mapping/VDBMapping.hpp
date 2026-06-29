@@ -405,7 +405,12 @@ public:
       return false;
     }
     std::unique_lock map_lock(*m_map_mutex);
-    return createMapFromPointCloud(cloud, set_background, clear_map);
+    const bool success = createMapFromPointCloud(cloud, set_background, clear_map);
+    // The grid contents were rewritten in place; drop any VolumeRayIntersector
+    // built from the previous topology (mirrors loadMap/resetMap) so the next
+    // fast-mode query does not run against a stale snapshot.
+    resetVolumeRayIntersectors();
+    return success;
   }
 
   /*!
@@ -529,6 +534,13 @@ public:
    */
   bool removePointsFromGrid(const PointCloudT::ConstPtr& cloud)
   {
+    // setNodeToFree writes m_min_logodds, which is uninitialized until
+    // setConfig has run; reject the call instead of storing garbage.
+    if (!m_config_set)
+    {
+      logMessage(LogLevel::Error, "Map not properly configured. Did you call setConfig method?");
+      return false;
+    }
     std::unique_lock map_lock(*m_map_mutex);
     typename GridT::Accessor acc = m_vdb_grid->getAccessor();
 
@@ -540,6 +552,10 @@ public:
       openvdb::Coord index_pt = this->worldToIndex(openvdb::Vec3d(pt.x, pt.y, pt.z));
       acc.modifyValueAndActiveState(index_pt, set_node);
     }
+    // In-place mutation leaves any VolumeRayIntersector built from the previous
+    // topology stale; drop them so the next fast-mode query falls back to an
+    // exact DDA until the next integration rebuilds them.
+    resetVolumeRayIntersectors();
     return true;
   }
 
@@ -550,6 +566,13 @@ public:
    */
   bool addPointsToGrid(const PointCloudT::ConstPtr& cloud)
   {
+    // setNodeToOccupied writes m_max_logodds, which is uninitialized until
+    // setConfig has run; reject the call instead of storing garbage.
+    if (!m_config_set)
+    {
+      logMessage(LogLevel::Error, "Map not properly configured. Did you call setConfig method?");
+      return false;
+    }
     std::unique_lock map_lock(*m_map_mutex);
     typename GridT::Accessor acc = m_vdb_grid->getAccessor();
     auto set_node                = [&](TData& voxel_value, bool& active) {
@@ -560,6 +583,10 @@ public:
       openvdb::Coord index_pt = this->worldToIndex(openvdb::Vec3d(pt.x, pt.y, pt.z));
       acc.modifyValueAndActiveState(index_pt, set_node);
     }
+    // In-place mutation leaves any VolumeRayIntersector built from the previous
+    // topology stale; drop them so the next fast-mode query falls back to an
+    // exact DDA until the next integration rebuilds them.
+    resetVolumeRayIntersectors();
     return true;
   }
 
@@ -814,15 +841,29 @@ public:
     end_points.resize(ray_origins_world.size());
     for (size_t i = 0; i < ray_origins_world.size(); i++)
     {
+      successes[i] = false;
+
+      // Guard against degenerate queries: a zero-length or non-finite direction
+      // would yield NaN after normalize() and feed NaN times/coordinates into
+      // the DDA and intersector (raycastPointCloud guards its inputs the same
+      // way). Report a miss anchored at the origin instead of corrupting state.
+      const openvdb::Vec3d& raw_direction = ray_directions[i];
+      if (!std::isfinite(raw_direction.x()) || !std::isfinite(raw_direction.y()) ||
+          !std::isfinite(raw_direction.z()) || raw_direction.lengthSqr() <= 0.0 ||
+          !std::isfinite(max_ray_lengths[i]))
+      {
+        end_points[i] = ray_origins_world[i];
+        continue;
+      }
+
       // Normalize direction vector just to be sure
-      openvdb::Vec3d direction_norm = ray_directions[i];
+      openvdb::Vec3d direction_norm = raw_direction;
       direction_norm.normalize();
       direction_norm *= max_ray_lengths[i];
 
       openvdb::Vec3d ray_origin_index    = m_vdb_grid->worldToIndex(ray_origins_world[i]);
       openvdb::Vec3d ray_direction_index = m_vdb_grid->worldToIndex(direction_norm);
 
-      successes[i]  = false;
       end_points[i] = m_vdb_grid->indexToWorld(ray_origin_index + ray_direction_index);
 
       if (!local_intersector)
@@ -850,8 +891,15 @@ public:
 
       // Ray times must be strictly positive: a t0 of exactly 0 trips
       // Ray::setTimes' assertion inside the intersector when the origin lies
-      // within an occupied leaf node.
-      RayT ray(ray_origin_index, ray_direction_index, openvdb::math::Delta<double>::value(), 1);
+      // within an occupied leaf node. The +0.5 shift matches the cell-centered
+      // voxel convention used by every other DDA in this file (worldToIndex
+      // rounds to the nearest lattice point); without it this branch would
+      // traverse the lattice half a voxel off and miss obstacles on the
+      // geometric ray for non-axis-aligned queries.
+      RayT ray(ray_origin_index + openvdb::Vec3d(0.5),
+               ray_direction_index,
+               openvdb::math::Delta<double>::value(),
+               1);
 
       if (!local_intersector->setIndexRay(ray))
       {
@@ -866,7 +914,10 @@ public:
       double t1;
       while (!successes[i] && local_intersector->march(t0, t1))
       {
-        RayT fine_ray(ray_origin_index, ray_direction_index, t0, t1);
+        // Same +0.5 cell-centered shift as the coarse ray above; march()'s
+        // t-values are in that ray's parameterization so the fine ray must use
+        // the identical shifted origin.
+        RayT fine_ray(ray_origin_index + openvdb::Vec3d(0.5), ray_direction_index, t0, t1);
         DDAT dda(fine_ray);
         // Check the current voxel before stepping: the first voxel of a span
         // is a valid candidate (leaf-aligned obstacles start exactly there).
@@ -959,7 +1010,17 @@ public:
    *
    * \returns Map pointer
    */
-  typename GridT::Ptr getGrid() const { return m_vdb_grid; }
+  typename GridT::Ptr getGrid() const
+  {
+    // Synchronise the shared_ptr read against resetMap/loadMap, which rebind
+    // m_vdb_grid under the unique lock (an unguarded copy concurrent with the
+    // rebind is a data race on the control block). NOTE: this only makes
+    // fetching the handle safe; the integration thread keeps mutating the
+    // returned grid's tree, so callers reading it concurrently must hold
+    // getMapMutex() in shared mode for the lifetime of the returned pointer.
+    std::shared_lock map_lock(*m_map_mutex);
+    return m_vdb_grid;
+  }
 
   /*!
    * \brief Returns the resolution of the map
@@ -1223,6 +1284,9 @@ public:
         acc.setValueOff(coord, section_acc.getValue(coord));
       }
     }
+    // The map was mutated in place; drop intersectors built from the stale
+    // topology (the next integration rebuilds them).
+    resetVolumeRayIntersectors();
     map_lock.unlock();
   }
 
@@ -1259,6 +1323,9 @@ public:
         acc.setValueOff(coord, section_acc.getValue(coord));
       }
     }
+    // The map was mutated in place; drop intersectors built from the stale
+    // topology (the next integration rebuilds them).
+    resetVolumeRayIntersectors();
     map_lock.unlock();
   }
 
@@ -1282,9 +1349,27 @@ public:
     typename UpdateGridT::Accessor section_acc = section->getAccessor();
     std::unique_lock map_lock(*m_map_mutex);
     typename GridT::Accessor acc = m_vdb_grid->getAccessor();
-    openvdb::Vec3d min           = section->template metaValue<openvdb::Vec3d>("bb_min");
-    openvdb::Vec3d max           = section->template metaValue<openvdb::Vec3d>("bb_max");
-    openvdb::CoordBBox bbox(openvdb::Coord::floor(min), openvdb::Coord::floor(max));
+
+    // bb_min/bb_max are written by getMapSection. A hand-built section, or one
+    // that lost its metadata in a transport round trip, will not carry them;
+    // metaValue throws on a missing key, which would otherwise abort this call
+    // (with the map lock held) on an opaque OpenVDB error. Fall back to the
+    // section's own active bounding box for the cleared region instead.
+    auto bb_min_meta = section->template getMetadata<openvdb::Vec3DMetadata>("bb_min");
+    auto bb_max_meta = section->template getMetadata<openvdb::Vec3DMetadata>("bb_max");
+    openvdb::CoordBBox bbox;
+    if (bb_min_meta && bb_max_meta)
+    {
+      bbox = openvdb::CoordBBox(openvdb::Coord::floor(bb_min_meta->value()),
+                                openvdb::Coord::floor(bb_max_meta->value()));
+    }
+    else
+    {
+      logMessage(LogLevel::Warning,
+                 "Map section update grid is missing bb_min/bb_max metadata; falling back to its "
+                 "active bounding box for the cleared region");
+      bbox = section->evalActiveVoxelBoundingBox();
+    }
 
     // Walk only leaves that overlap the section bbox instead of every active
     // voxel in the entire map.
@@ -1306,9 +1391,24 @@ public:
     {
       acc.setActiveState(iter.getCoord(), true);
     }
+    // The map was mutated in place; drop intersectors built from the stale
+    // topology (the next integration rebuilds them).
+    resetVolumeRayIntersectors();
     map_lock.unlock();
   }
 
+  /*!
+   * \brief Applies a map section update grid to the map after transforming it
+   *
+   * Unlike applyMapSectionUpdateGrid this variant is additive: it only sets the
+   * transformed section's active voxels and never clears the destination
+   * region, so previously-active voxels that are now free are NOT removed.
+   *
+   * \param section Section update grid to apply
+   * \param transform Transform applied to the section before merging
+   * \param smooth_map Specifies if the section should be morphologically smoothed
+   * \param smoothing_iterations Amount of morphological smoothing iterations
+   */
   void transformAndApplyMapSectionUpdateGrid(const typename UpdateGridT::Ptr section,
                                              const Eigen::Matrix<double, 4, 4>& transform,
                                              bool smooth_map          = false,
@@ -1333,6 +1433,9 @@ public:
         openvdb::Coord::floor(openvdb::Vec3d(buffer.x() + 0.5, buffer.y() + 0.5, buffer.z() + 0.5)),
         true);
     }
+    // The map was mutated in place; drop intersectors built from the stale
+    // topology (the next integration rebuilds them).
+    resetVolumeRayIntersectors();
     map_lock.unlock();
   }
 
@@ -1452,6 +1555,9 @@ protected:
     }
     m_artificial_area_grid->clear();
     m_artificial_areas_present = false;
+    // The map was mutated in place; drop intersectors built from the stale
+    // topology (the next integration rebuilds them).
+    resetVolumeRayIntersectors();
   }
 
   void addArtificialWallLocked(const Eigen::Matrix<double, 4, 1>& start,
@@ -1586,7 +1692,7 @@ public:
    * \returns Pointer to the unpacked grid, nullptr if the data could not be parsed
    */
   template <typename TGrid>
-  typename TGrid::Ptr byteArrayToGrid(std::vector<uint8_t> byte_array)
+  typename TGrid::Ptr byteArrayToGrid(const std::vector<uint8_t>& byte_array)
   {
     try
     {
@@ -1745,6 +1851,9 @@ public:
    */
   void updateVolumeRayIntersectors()
   {
+    // NOTE: fast mode requires GridT == openvdb::FloatGrid. VolumeRayIntersector
+    // is hardcoded to FloatGrid throughout this class, so a non-float TData
+    // specialization will fail to compile here once fast mode is exercised.
     if (m_fast_mode && !m_vdb_grid->empty())
     {
       m_volume_ray_intersector =
@@ -1880,9 +1989,11 @@ protected:
    */
   std::atomic<double> m_max_range{0.0};
   /*!
-   * \brief Grid resolution of the map
+   * \brief Grid resolution of the map.
+   * Atomic because loadMap may overwrite it (when a loaded map's resolution
+   * differs) while getResolution / getMapSection read it from other threads.
    */
-  double m_resolution;
+  std::atomic<double> m_resolution;
 
   /*!
    * \brief Should vdb_mapping operate in the fast raycasting method.
