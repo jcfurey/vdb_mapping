@@ -612,6 +612,108 @@ TEST(Mapping, MorphologicalDilateErode)
   EXPECT_EQ(grid->activeVoxelCount(), 1u);
 }
 
+TEST(Mapping, RaytraceFastModeOffAxisHit)
+{
+  // Regression: the fast-mode (VolumeRayIntersector) branch of raytrace omitted
+  // the +0.5 cell-centered shift that every other DDA in the library uses, so
+  // for off-axis rays it traversed the lattice half a voxel off and missed
+  // obstacles lying on the geometric ray. The axis-aligned raytrace tests
+  // cannot see this because floor(integer)=integer makes both conventions land
+  // on the same lattice line.
+  double resolution = 0.1;
+  OccupancyVDBMapping map(resolution);
+  // Single obstacle that the cell-centered ray (1,0,2) from the origin passes
+  // through; the un-shifted (buggy) ray walks the neighbouring column and
+  // misses it entirely.
+  setupFastModeMap(map, {{1.4f, 0.0f, 2.7f}});
+
+  bool success;
+  openvdb::Vec3d end_point;
+  map.raytrace(openvdb::Vec3d(0, 0, 0), openvdb::Vec3d(1, 0, 2), 5.0, success, end_point);
+  EXPECT_TRUE(success);
+  EXPECT_NEAR(end_point.x(), 1.4, resolution);
+  EXPECT_NEAR(end_point.z(), 2.7, resolution);
+}
+
+TEST(Mapping, AddPointsInvalidatesIntersector)
+{
+  // Regression: addPointsToGrid mutated the grid in place but left the
+  // VolumeRayIntersector pointing at the pre-mutation topology, so a fast-mode
+  // raytrace before the next integration walked the stale snapshot and missed
+  // the newly added obstacle.
+  double resolution = 0.1;
+  OccupancyVDBMapping map(resolution);
+  // Obstacle A far along +x; the integration cycle builds the intersector
+  // around its leaf.
+  setupFastModeMap(map, {{20.0f, 0.0f, 0.0f}});
+
+  bool success;
+  openvdb::Vec3d end_point;
+  map.raytrace(openvdb::Vec3d(0, 0, 0), openvdb::Vec3d(1, 0, 0), 30.0, success, end_point);
+  EXPECT_TRUE(success);
+  EXPECT_NEAR(end_point.x(), 20.0, resolution);
+
+  // Add a nearer obstacle B in a different leaf WITHOUT re-integrating.
+  OccupancyVDBMapping::PointCloudT::Ptr b(new OccupancyVDBMapping::PointCloudT);
+  b->points.emplace_back(10.0f, 0.0f, 0.0f);
+  map.addPointsToGrid(b);
+
+  // The ray must now stop at B (10 m), not the stale A (20 m).
+  map.raytrace(openvdb::Vec3d(0, 0, 0), openvdb::Vec3d(1, 0, 0), 30.0, success, end_point);
+  EXPECT_TRUE(success);
+  EXPECT_NEAR(end_point.x(), 10.0, resolution);
+}
+
+TEST(Mapping, DirectGridEditsRequireConfig)
+{
+  // addPointsToGrid / removePointsFromGrid write m_max_logodds / m_min_logodds,
+  // which are uninitialized until setConfig runs; both must refuse before the
+  // map is configured instead of storing garbage log odds.
+  OccupancyVDBMapping map(0.1);
+  OccupancyVDBMapping::PointCloudT::Ptr cloud(new OccupancyVDBMapping::PointCloudT);
+  cloud->points.emplace_back(1.0f, 0.0f, 0.0f);
+
+  EXPECT_FALSE(map.addPointsToGrid(cloud));
+  EXPECT_FALSE(map.removePointsFromGrid(cloud));
+  EXPECT_EQ(map.getGrid()->activeVoxelCount(), 0u);
+}
+
+TEST(Mapping, ClampMustStrictlyEncloseThresholds)
+{
+  // A clamp equal to an activation threshold lets a voxel saturate exactly AT
+  // the threshold and never cross the strict comparison, so a saturated
+  // obstacle would stay inactive. Such configs must be rejected.
+  OccupancyVDBMapping map(1);
+  std::vector<std::string> errors;
+  map.setLogCallback([&](OccupancyVDBMapping::LogLevel level, const std::string& msg) {
+    if (level == OccupancyVDBMapping::LogLevel::Error)
+    {
+      errors.push_back(msg);
+    }
+  });
+
+  Config conf;
+  conf.max_range      = 10;
+  conf.fast_mode      = false;
+  conf.prob_hit       = 0.9;
+  conf.prob_miss      = 0.1;
+  conf.prob_thres_max = 0.51;
+  conf.prob_thres_min = 0.49;
+
+  // clamp_max exactly equal to thres_max must be rejected
+  conf.prob_clamp_min = 0.01;
+  conf.prob_clamp_max = 0.51;
+  map.setConfig(conf);
+  EXPECT_EQ(errors.size(), 1u);
+
+  // clamp_min exactly equal to thres_min must be rejected
+  errors.clear();
+  conf.prob_clamp_max = 0.99;
+  conf.prob_clamp_min = 0.49;
+  map.setConfig(conf);
+  EXPECT_EQ(errors.size(), 1u);
+}
+
 } // namespace vdb_mapping
 
 int main(int argc, char** argv)

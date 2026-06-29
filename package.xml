@@ -18,7 +18,6 @@
   <depend>eigen</depend>
   <depend>libopenvdb-dev</depend>
   <depend>libpcl-all-dev</depend>
-  <depend>libpcl-all</depend>
   <depend>tbb</depend>
   <depend>libzstd-dev</depend>
 
