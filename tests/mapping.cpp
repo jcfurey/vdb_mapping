@@ -1,5 +1,7 @@
 #include "gtest/gtest.h"
 #include <array>
+#include <cmath>
+#include <limits>
 #include <vdb_mapping/OccupancyVDBMapping.hpp>
 #include <vector>
 
@@ -676,6 +678,138 @@ TEST(Mapping, DirectGridEditsRequireConfig)
   EXPECT_FALSE(map.addPointsToGrid(cloud));
   EXPECT_FALSE(map.removePointsFromGrid(cloud));
   EXPECT_EQ(map.getGrid()->activeVoxelCount(), 0u);
+}
+
+TEST(Mapping, NonFinitePointsAreSkipped)
+{
+  // Regression: the insertion path only filtered NaN, not inf. Lidar drivers
+  // commonly encode no-return points as +/-inf; the max-range clipping turned
+  // such a point into a NaN endpoint, Coord::floor(NaN) into INT_MIN, and the
+  // DDA then walked ~2^31 voxels toward it (multi-GB allocation / hang).
+  double resolution = 0.1;
+  OccupancyVDBMapping map(resolution);
+  Config conf;
+  conf.max_range      = 10;
+  conf.fast_mode      = false;
+  conf.prob_hit       = 0.9;
+  conf.prob_miss      = 0.1;
+  conf.prob_thres_max = 0.51;
+  conf.prob_thres_min = 0.49;
+  map.setConfig(conf);
+  map.addInputSource("test", conf.max_range, 0);
+
+  const float inf = std::numeric_limits<float>::infinity();
+  OccupancyVDBMapping::PointCloudT::Ptr cloud(new OccupancyVDBMapping::PointCloudT);
+  cloud->points.emplace_back(inf, 0.0f, 0.0f);
+  cloud->points.emplace_back(-inf, inf, 0.0f);
+  cloud->points.emplace_back(std::nanf(""), 0.0f, 0.0f);
+  cloud->points.emplace_back(0.0f, 0.0f, 5 * static_cast<float>(resolution));
+  Eigen::Matrix<double, 3, 1> origin(0, 0, 0);
+  map.insertPointCloud(cloud, origin, "test");
+
+  // Only the finite point and the free voxels along its short ray may exist;
+  // the map bounding box must stay tight around it.
+  OccupancyVDBMapping::GridT::Accessor acc = map.getGrid()->getAccessor();
+  EXPECT_TRUE(acc.isValueOn(openvdb::Coord(0, 0, 5)));
+  openvdb::CoordBBox bbox = map.getGrid()->evalActiveVoxelBoundingBox();
+  EXPECT_GE(bbox.min().z(), -1);
+  EXPECT_LE(bbox.max().z(), 6);
+  EXPECT_LE(bbox.max().x(), 1);
+
+  // Direct grid edits must skip non-finite points as well
+  map.resetMap();
+  map.addPointsToGrid(cloud);
+  bbox = map.getGrid()->evalActiveVoxelBoundingBox();
+  EXPECT_EQ(map.getGrid()->activeVoxelCount(), 1u);
+  EXPECT_LE(bbox.max().x(), 1);
+}
+
+TEST(Mapping, RaytraceDegenerateInputs)
+{
+  // Degenerate queries (zero/non-finite direction, non-finite origin,
+  // non-positive or non-finite max length, mismatched batch arrays) must
+  // report clean misses instead of feeding NaN into the DDA/intersector or
+  // reading out of bounds.
+  double resolution = 0.1;
+  OccupancyVDBMapping map(resolution);
+  setupFastModeMap(map, {{20.0f, 0.0f, 0.0f}});
+
+  const double inf = std::numeric_limits<double>::infinity();
+  bool success;
+  openvdb::Vec3d end_point;
+
+  map.raytrace(openvdb::Vec3d(0, 0, 0), openvdb::Vec3d(0, 0, 0), 30.0, success, end_point);
+  EXPECT_FALSE(success);
+  EXPECT_TRUE(end_point == openvdb::Vec3d(0, 0, 0));
+
+  map.raytrace(openvdb::Vec3d(0, 0, 0), openvdb::Vec3d(inf, 0, 0), 30.0, success, end_point);
+  EXPECT_FALSE(success);
+
+  map.raytrace(openvdb::Vec3d(inf, 0, 0), openvdb::Vec3d(1, 0, 0), 30.0, success, end_point);
+  EXPECT_FALSE(success);
+
+  map.raytrace(openvdb::Vec3d(0, 0, 0), openvdb::Vec3d(1, 0, 0), 0.0, success, end_point);
+  EXPECT_FALSE(success);
+
+  map.raytrace(openvdb::Vec3d(0, 0, 0), openvdb::Vec3d(1, 0, 0), -5.0, success, end_point);
+  EXPECT_FALSE(success);
+
+  // Mismatched batch arrays must fail cleanly with per-ray misses
+  std::vector<openvdb::Vec3d> origins = {openvdb::Vec3d(0, 0, 0), openvdb::Vec3d(1, 0, 0)};
+  std::vector<openvdb::Vec3d> dirs    = {openvdb::Vec3d(1, 0, 0)};
+  std::vector<double> lengths         = {30.0, 30.0};
+  std::vector<bool> successes;
+  std::vector<openvdb::Vec3d> end_points;
+  map.raytrace(origins, dirs, lengths, successes, end_points);
+  ASSERT_EQ(successes.size(), 2u);
+  EXPECT_FALSE(successes[0]);
+  EXPECT_FALSE(successes[1]);
+
+  // A well-formed query on the same map must still work
+  map.raytrace(openvdb::Vec3d(0, 0, 0), openvdb::Vec3d(1, 0, 0), 30.0, success, end_point);
+  EXPECT_TRUE(success);
+  EXPECT_NEAR(end_point.x(), 20.0, resolution);
+}
+
+TEST(Mapping, SaveMapToPCDEmptyMapFails)
+{
+  // savePCDFile throws on an empty cloud; an empty map must produce a logged
+  // error and a false return, not an uncaught exception.
+  OccupancyVDBMapping map(1);
+  Config conf;
+  conf.max_range          = 10;
+  conf.fast_mode          = false;
+  conf.prob_hit           = 0.9;
+  conf.prob_miss          = 0.1;
+  conf.prob_thres_max     = 0.51;
+  conf.prob_thres_min     = 0.49;
+  conf.map_directory_path = testing::TempDir();
+  map.setConfig(conf);
+
+  EXPECT_FALSE(map.saveMapToPCD());
+}
+
+TEST(Mapping, ByteArrayToGridSelectsCompatibleGrid)
+{
+  // byteArrayToGrid used to cast only the first grid in the payload; a
+  // multi-grid stream whose compatible grid is not first returned nullptr.
+  OccupancyVDBMapping map(1);
+
+  OccupancyVDBMapping::UpdateGridT::Ptr bool_grid = OccupancyVDBMapping::UpdateGridT::create(false);
+  bool_grid->getAccessor().setValueOn(openvdb::Coord(1, 2, 3), true);
+  OccupancyVDBMapping::GridT::Ptr float_grid = OccupancyVDBMapping::GridT::create(0.0f);
+  float_grid->getAccessor().setValueOn(openvdb::Coord(4, 5, 6), 1.5f);
+
+  openvdb::GridPtrVec grids;
+  grids.push_back(bool_grid);
+  grids.push_back(float_grid);
+  std::ostringstream oss(std::ios_base::binary);
+  openvdb::io::Stream(oss).write(grids);
+  std::vector<uint8_t> bytes = map.compressString(oss.str());
+
+  auto restored = map.byteArrayToGrid<OccupancyVDBMapping::GridT>(bytes);
+  ASSERT_NE(restored, nullptr);
+  EXPECT_FLOAT_EQ(restored->getAccessor().getValue(openvdb::Coord(4, 5, 6)), 1.5f);
 }
 
 TEST(Mapping, ClampMustStrictlyEncloseThresholds)

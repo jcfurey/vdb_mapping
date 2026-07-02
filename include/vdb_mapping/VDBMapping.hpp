@@ -317,9 +317,24 @@ public:
     cloud->width  = cloud->points.size();
     cloud->height = 1;
 
-    if (pcl::io::savePCDFile(pcd_path, *cloud) != 0)
+    // savePCDFile throws (rather than returning nonzero) on an empty cloud,
+    // which would otherwise escape a ROS service callback uncaught.
+    if (cloud->points.empty())
     {
-      logMessage(LogLevel::Error, "Could not write PCD file to " + pcd_path);
+      logMessage(LogLevel::Error, "Map contains no active voxels, not writing " + pcd_path);
+      return false;
+    }
+    try
+    {
+      if (pcl::io::savePCDFile(pcd_path, *cloud) != 0)
+      {
+        logMessage(LogLevel::Error, "Could not write PCD file to " + pcd_path);
+        return false;
+      }
+    }
+    catch (const std::exception& e)
+    {
+      logMessage(LogLevel::Error, "Could not write PCD file to " + pcd_path + ": " + e.what());
       return false;
     }
     logMessage(LogLevel::Info, "Wrote pcd to: " + pcd_path);
@@ -549,6 +564,12 @@ public:
 
     for (const PointT& pt : *cloud)
     {
+      // A non-finite point would floor to an extreme coordinate (e.g. INT_MIN)
+      // and corrupt every bbox-derived operation afterwards.
+      if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z))
+      {
+        continue;
+      }
       openvdb::Coord index_pt = this->worldToIndex(openvdb::Vec3d(pt.x, pt.y, pt.z));
       acc.modifyValueAndActiveState(index_pt, set_node);
     }
@@ -580,6 +601,12 @@ public:
     };
     for (const PointT& pt : *cloud)
     {
+      // A non-finite point would floor to an extreme coordinate (e.g. INT_MIN)
+      // and corrupt every bbox-derived operation afterwards.
+      if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z))
+      {
+        continue;
+      }
       openvdb::Coord index_pt = this->worldToIndex(openvdb::Vec3d(pt.x, pt.y, pt.z));
       acc.modifyValueAndActiveState(index_pt, set_node);
     }
@@ -628,11 +655,11 @@ public:
     // Ray origin in world coordinates
     openvdb::Vec3d ray_origin_world(origin.x(), origin.y(), origin.z());
 
-    // Check origin for NaN once before the loop since it is constant
-    if (std::isnan(ray_origin_world.x()) || std::isnan(ray_origin_world.y()) ||
-        std::isnan(ray_origin_world.z()))
+    // Check origin for NaN/inf once before the loop since it is constant
+    if (!std::isfinite(ray_origin_world.x()) || !std::isfinite(ray_origin_world.y()) ||
+        !std::isfinite(ray_origin_world.z()))
     {
-      logMessage(LogLevel::Error, "Ray origin contains NaN values");
+      logMessage(LogLevel::Error, "Ray origin contains non-finite values");
       return false;
     }
 
@@ -650,8 +677,13 @@ public:
       ray_end_world      = openvdb::Vec3d(pt.x, pt.y, pt.z);
       bool max_range_ray = false;
 
-      if (std::isnan(ray_end_world.x()) || std::isnan(ray_end_world.y()) ||
-          std::isnan(ray_end_world.z()))
+      // isfinite, not just isnan: lidar drivers commonly encode no-return
+      // points as +/-inf. An inf point passes a NaN check, but the max-range
+      // clipping below turns it into NaN ((inf - origin).unit() = NaN), which
+      // Coord::floor converts to INT_MIN — and the DDA then walks ~2^31 voxels
+      // toward that coordinate, allocating leaves the whole way.
+      if (!std::isfinite(ray_end_world.x()) || !std::isfinite(ray_end_world.y()) ||
+          !std::isfinite(ray_end_world.z()))
       {
         continue;
       }
@@ -837,22 +869,38 @@ public:
     }
 
     typename GridT::Accessor acc = m_vdb_grid->getAccessor();
-    successes.resize(ray_origins_world.size());
-    end_points.resize(ray_origins_world.size());
+    successes.assign(ray_origins_world.size(), false);
+    end_points = ray_origins_world;
+
+    // The three input arrays are indexed in lockstep; mismatched sizes would
+    // read out of bounds below.
+    if (ray_directions.size() != ray_origins_world.size() ||
+        max_ray_lengths.size() != ray_origins_world.size())
+    {
+      logMessage(LogLevel::Error,
+                 "Raytrace input arrays differ in size (origins=" +
+                   std::to_string(ray_origins_world.size()) +
+                   ", directions=" + std::to_string(ray_directions.size()) +
+                   ", max_lengths=" + std::to_string(max_ray_lengths.size()) + ")");
+      return;
+    }
+
     for (size_t i = 0; i < ray_origins_world.size(); i++)
     {
-      successes[i] = false;
-
-      // Guard against degenerate queries: a zero-length or non-finite direction
-      // would yield NaN after normalize() and feed NaN times/coordinates into
-      // the DDA and intersector (raycastPointCloud guards its inputs the same
-      // way). Report a miss anchored at the origin instead of corrupting state.
+      // Guard against degenerate queries: a non-finite origin, a zero-length
+      // or non-finite direction, or a non-positive ray length would yield NaN
+      // after normalize() (or a zero-direction ray) and feed NaN
+      // times/coordinates into the DDA and intersector (raycastPointCloud
+      // guards its inputs the same way). Report a miss anchored at the origin
+      // instead of corrupting state.
+      const openvdb::Vec3d& raw_origin    = ray_origins_world[i];
       const openvdb::Vec3d& raw_direction = ray_directions[i];
-      if (!std::isfinite(raw_direction.x()) || !std::isfinite(raw_direction.y()) ||
-          !std::isfinite(raw_direction.z()) || raw_direction.lengthSqr() <= 0.0 ||
-          !std::isfinite(max_ray_lengths[i]))
+      if (!std::isfinite(raw_origin.x()) || !std::isfinite(raw_origin.y()) ||
+          !std::isfinite(raw_origin.z()) || !std::isfinite(raw_direction.x()) ||
+          !std::isfinite(raw_direction.y()) || !std::isfinite(raw_direction.z()) ||
+          raw_direction.lengthSqr() <= 0.0 || !std::isfinite(max_ray_lengths[i]) ||
+          max_ray_lengths[i] <= 0.0)
       {
-        end_points[i] = ray_origins_world[i];
         continue;
       }
 
@@ -1016,8 +1064,10 @@ public:
     // m_vdb_grid under the unique lock (an unguarded copy concurrent with the
     // rebind is a data race on the control block). NOTE: this only makes
     // fetching the handle safe; the integration thread keeps mutating the
-    // returned grid's tree, so callers reading it concurrently must hold
-    // getMapMutex() in shared mode for the lifetime of the returned pointer.
+    // returned grid's tree, so callers reading it concurrently must fetch the
+    // handle FIRST and then hold getMapMutex() in shared mode while reading.
+    // (Do not lock before calling getGrid(): that would recursively acquire
+    // the non-recursive shared_mutex from the same thread.)
     std::shared_lock map_lock(*m_map_mutex);
     return m_vdb_grid;
   }
@@ -1704,9 +1754,19 @@ public:
         logMessage(LogLevel::Error, "Byte array contains no grids");
         return nullptr;
       }
-      // This cast might fail if different VDB versions are used.
+      // Scan for the first compatible grid instead of only trying the front
+      // one, matching loadMap's behavior for multi-grid payloads.
+      // The cast might also fail if different VDB versions are used.
       // Corresponding error messages are generated by VDB directly
-      return openvdb::gridPtrCast<TGrid>(grids->front());
+      for (const openvdb::GridBase::Ptr& grid : *grids)
+      {
+        if (typename TGrid::Ptr cast_grid = openvdb::gridPtrCast<TGrid>(grid))
+        {
+          return cast_grid;
+        }
+      }
+      logMessage(LogLevel::Error, "Byte array contains no compatible grid");
+      return nullptr;
     }
     catch (const std::exception& e)
     {
@@ -1748,9 +1808,21 @@ public:
     {
       s->max_input_period = std::chrono::milliseconds((int)(1000.0 / max_rate));
     }
+    if (s->max_range <= 0)
+    {
+      // accumulateUpdate skips sources with a non-positive max range entirely
+      // (inherited upstream behavior); without a warning this reads as the
+      // map silently never updating.
+      logMessage(LogLevel::Warning,
+                 "Input source " + source_id + " has max range " + std::to_string(s->max_range) +
+                   "; its data will not be integrated");
+    }
     {
       // Register under the map lock: other threads read m_input_sources under
-      // the shared lock.
+      // the shared lock. m_worker_threads is guarded by the same lock so two
+      // concurrent registrations do not race on the map insert; starting the
+      // worker inside the lock is safe because its first action is to block on
+      // the shared lock until registration completes.
       std::unique_lock map_lock(*m_map_mutex);
       if (m_input_sources.find(source_id) != m_input_sources.end())
       {
@@ -1758,10 +1830,8 @@ public:
         return;
       }
       m_input_sources[s->source_id] = s;
+      m_worker_threads[source_id]   = std::thread(&VDBMapping::accumulationThread, this, source_id);
     }
-    // Start the worker only after the source is registered, otherwise the
-    // thread races the insertion and can look up a not-yet-existing entry.
-    m_worker_threads[source_id] = std::thread(&VDBMapping::accumulationThread, this, source_id);
   }
 
 

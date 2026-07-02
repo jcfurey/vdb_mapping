@@ -197,6 +197,13 @@ protected:
 
     for (const auto& point : cloud->points)
     {
+      // A non-finite point would floor to an extreme coordinate and blow up
+      // the background sparseFill below (its bbox would span the entire
+      // coordinate range).
+      if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z))
+      {
+        continue;
+      }
       acc.setValueOn(this->worldToIndex(openvdb::Vec3d(point.x, point.y, point.z)), m_max_logodds);
     }
 
