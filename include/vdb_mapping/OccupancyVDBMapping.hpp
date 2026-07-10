@@ -129,6 +129,28 @@ public:
   }
 
 protected:
+  // Per-source probability overrides (VDBMapping::integrateUpdate): swap the
+  // active log-odds for the duration of one source's updateMap. Runs under
+  // the exclusive map lock, so plain member swaps are safe.
+  void applySourceProbabilityOverride(double prob_hit, double prob_miss) override
+  {
+    m_logodds_hit_default  = m_logodds_hit;
+    m_logodds_miss_default = m_logodds_miss;
+    if (prob_hit > 0.0 && prob_hit < 1.0)
+    {
+      m_logodds_hit = static_cast<float>(log(prob_hit) - log(1 - prob_hit));
+    }
+    if (prob_miss > 0.0 && prob_miss < 1.0)
+    {
+      m_logodds_miss = static_cast<float>(log(prob_miss) - log(1 - prob_miss));
+    }
+  }
+  void clearSourceProbabilityOverride() override
+  {
+    m_logodds_hit  = m_logodds_hit_default;
+    m_logodds_miss = m_logodds_miss_default;
+  }
+
   // Clamping update policy, L = max(min(L + l, l_max), l_min) (OctoMap
   // Eq. 4): the clamp applies on every update so the confidence stays
   // bounded; the activation thresholds then switch the voxel state with
@@ -247,6 +269,11 @@ protected:
    * \brief Probability update value for passing free space
    */
   float m_logodds_miss = 0.0f;
+  /*!
+   * \brief Saved map-wide log-odds while a per-source override is active
+   */
+  float m_logodds_hit_default  = 0.0f;
+  float m_logodds_miss_default = 0.0f;
   /*!
    * \brief Lower occupancy probability threshold below which a voxel is deactivated
    */

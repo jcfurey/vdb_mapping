@@ -105,6 +105,15 @@ public:
     std::optional<std::pair<PointCloudT::ConstPtr, Eigen::Matrix<double, 3, 1> > > input_data;
     std::chrono::milliseconds max_input_period;
     std::condition_variable data_available_cv;
+    // Per-source behavior (defaults preserve the upstream lidar-style
+    // semantics: every point clears along its ray and hits its endpoint).
+    // Decoupling the two lets e.g. a sonar stack fill from confident hit
+    // points only (no self-erosion by grazing rays) while a dedicated
+    // clearing cloud carves geometry-aware free space.
+    bool ray_clearing  = true;  // rays carve free space toward each point
+    bool endpoint_hits = true;  // endpoints are marked occupied
+    double prob_hit  = -1.0;    // <= 0: use the map-wide probability
+    double prob_miss = -1.0;
   };
 
   /*!
@@ -463,11 +472,19 @@ public:
                           origin,
                           source->second->max_range,
                           update_grid_acc,
-                          source->second->volume_ray_intersector);
+                          source->second->volume_ray_intersector,
+                          source->second->ray_clearing,
+                          source->second->endpoint_hits);
       }
       else
       {
-        raycastPointCloud(cloud, origin, source->second->max_range, update_grid_acc);
+        raycastPointCloud(cloud,
+                          origin,
+                          source->second->max_range,
+                          update_grid_acc,
+                          std::nullopt,
+                          source->second->ray_clearing,
+                          source->second->endpoint_hits);
       }
     }
   }
@@ -511,7 +528,11 @@ public:
       // resetMap touch it under the same mutex; the map lock alone does not
       // serialise against resetMap's swap.
       std::unique_lock update_grid_lock(source->update_grid_mutex);
+      // Per-source probability overrides apply for this source's grid only;
+      // safe because the exclusive map lock is held for the whole loop.
+      applySourceProbabilityOverride(source->prob_hit, source->prob_miss);
       updateMap(source->update_grid);
+      clearSourceProbabilityOverride();
 
       source->update_grid = UpdateGridT::create(false);
     }
@@ -640,7 +661,9 @@ public:
     const double raycast_range,
     UpdateGridT::Accessor& update_grid_acc,
     std::optional<std::shared_ptr<openvdb::tools::VolumeRayIntersector<openvdb::FloatGrid> > >
-      intersector = std::nullopt)
+      intersector = std::nullopt,
+    const bool ray_clearing  = true,
+    const bool endpoint_hits = true)
   {
     // Creating a temporary grid in which the new data is casted. This way we prevent the
     // computation of redundant probability updates in the actual map
@@ -696,22 +719,25 @@ public:
       }
 
       openvdb::Coord ray_end_index = this->worldToIndex(ray_end_world);
-      // Decide based on the provided intersector rather than m_fast_mode so a
-      // caller can never reach intersector.value() with an empty optional.
-      if (intersector.has_value() && intersector.value())
+      if (ray_clearing)
       {
-        if (!grid_empty)
+        // Decide based on the provided intersector rather than m_fast_mode so a
+        // caller can never reach intersector.value() with an empty optional.
+        if (intersector.has_value() && intersector.value())
         {
-          castRayIntoGridFast(
-            ray_origin_index, ray_end_index, acc, update_grid_acc, intersector.value());
+          if (!grid_empty)
+          {
+            castRayIntoGridFast(
+              ray_origin_index, ray_end_index, acc, update_grid_acc, intersector.value());
+          }
+        }
+        else
+        {
+          castRayIntoGrid(ray_origin_index, ray_end_index, update_grid_acc);
         }
       }
-      else
-      {
-        castRayIntoGrid(ray_origin_index, ray_end_index, update_grid_acc);
-      }
 
-      if (!max_range_ray)
+      if (!max_range_ray && endpoint_hits)
       {
         update_grid_acc.setValueOn(ray_end_index, true);
       }
@@ -1787,10 +1813,20 @@ public:
    * \param max_range Maximum raycasting range
    * \param max_rate Maximum integration rate
    */
-  void addInputSource(std::string source_id, double max_range, double max_rate)
+  void addInputSource(std::string source_id,
+                      double max_range,
+                      double max_rate,
+                      bool ray_clearing  = true,
+                      bool endpoint_hits = true,
+                      double prob_hit    = -1.0,
+                      double prob_miss   = -1.0)
   {
-    auto s       = std::make_shared<InputSource>();
-    s->source_id = source_id;
+    auto s           = std::make_shared<InputSource>();
+    s->source_id     = source_id;
+    s->ray_clearing  = ray_clearing;
+    s->endpoint_hits = endpoint_hits;
+    s->prob_hit      = prob_hit;
+    s->prob_miss     = prob_miss;
     if (max_range == 0)
     {
       s->max_range = m_max_range;
@@ -2013,6 +2049,24 @@ protected:
   // subclass) overrides these with concrete log-odds behaviour. The params
   // are named for documentation / IDE completion; [[maybe_unused]] silences
   // -Wunused-parameter for the default bodies without removing the names.
+  /*!
+   * \brief Applies a per-source hit/miss probability override for the
+   * duration of one updateMap call (values <= 0 keep the map-wide config).
+   * Called under the exclusive map lock. Base implementation ignores the
+   * override; probability-based subclasses translate it into their update
+   * weights.
+   */
+  virtual void applySourceProbabilityOverride([[maybe_unused]] double prob_hit,
+                                              [[maybe_unused]] double prob_miss)
+  {
+  }
+
+  /*!
+   * \brief Restores the map-wide probabilities after
+   * applySourceProbabilityOverride
+   */
+  virtual void clearSourceProbabilityOverride() {}
+
   virtual bool updateFreeNode([[maybe_unused]] TData& voxel_value, [[maybe_unused]] bool& active)
   {
     return false;
