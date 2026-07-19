@@ -1257,6 +1257,60 @@ public:
         }
       }
     }
+
+    // Pruned constant regions live as TILES at internal nodes (integrateUpdate
+    // calls pruneGrid every cycle), which the leaf iteration above misses.
+    // Iterate observed (non-background) tiles overlapping the region and fill
+    // their bbox-clamped extent with the same full/sparse semantics as the leaf
+    // helpers — otherwise large free/occupied volumes are dropped from the
+    // serialized section and a remote peer applying it gets holes.
+    {
+      const typename GridT::ValueType background = m_vdb_grid->background();
+      auto tile_iter = m_vdb_grid->tree().cbeginValueAll();
+      tile_iter.setMaxDepth(GridT::TreeType::DEPTH - 2);  // tiles, not voxels
+      for (; tile_iter; ++tile_iter)
+      {
+        if (tile_iter.getValue() == background)
+        {
+          continue;  // unobserved background — nothing to serialize
+        }
+        const bool tile_on = tile_iter.isValueOn();
+        if (!full_grid && !tile_on)
+        {
+          continue;  // sparse mode extracts active values only (extractSparseLeaf)
+        }
+        openvdb::CoordBBox tile_bbox;
+        tile_iter.getBoundingBox(tile_bbox);
+        tile_bbox.intersect(bounding_box);
+        if (tile_bbox.empty())
+        {
+          continue;
+        }
+        const typename GridT::ValueType val = tile_iter.getValue();
+        for (int z = tile_bbox.min().z(); z <= tile_bbox.max().z(); ++z)
+        {
+          for (int y = tile_bbox.min().y(); y <= tile_bbox.max().y(); ++y)
+          {
+            for (int x = tile_bbox.min().x(); x <= tile_bbox.max().x(); ++x)
+            {
+              const openvdb::Coord c(x, y, z);
+              if (full_grid)
+              {
+                tile_on ? temp_acc.setValueOn(c, val) : temp_acc.setValueOff(c, val);
+              }
+              else if constexpr (std::is_same_v<typename TResultGrid::ValueType, bool>)
+              {
+                temp_acc.setValueOn(c, true);
+              }
+              else
+              {
+                temp_acc.setValueOn(c, static_cast<typename TResultGrid::ValueType>(val));
+              }
+            }
+          }
+        }
+      }
+    }
     map_lock.unlock();
 
     openvdb::Vec3d min(bounding_box.min().x(), bounding_box.min().y(), bounding_box.min().z());
