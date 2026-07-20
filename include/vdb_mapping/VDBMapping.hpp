@@ -79,11 +79,11 @@ struct BaseConfig
 /*!
  * \brief Main Mapping class which handles all data integration
  */
-template <typename TData, typename TConfig = BaseConfig>
+template <typename TData, typename TConfig = BaseConfig, typename PointType = pcl::PointXYZ>
 class VDBMapping
 {
 public:
-  using PointT      = pcl::PointXYZ;
+  using PointT      = PointType;
   using PointCloudT = pcl::PointCloud<PointT>;
 
   using RayT  = openvdb::math::Ray<double>;
@@ -102,7 +102,7 @@ public:
     UpdateGridT::Ptr update_grid;
     std::mutex update_grid_mutex;
     std::mutex input_data_mutex;
-    std::optional<std::pair<PointCloudT::ConstPtr, Eigen::Matrix<double, 3, 1> > > input_data;
+    std::optional<std::pair<typename PointCloudT::ConstPtr, Eigen::Matrix<double, 3, 1> > > input_data;
     std::chrono::milliseconds max_input_period;
     std::condition_variable data_available_cv;
     // Per-source behavior (defaults preserve the upstream lidar-style
@@ -133,6 +133,11 @@ public:
   using LogCallbackT = std::function<void(LogLevel, const std::string&)>;
 
   /*!
+   * \brief Callback type for providing custom time (e.g. ROS time in nanoseconds)
+   */
+  using TimeCallbackT = std::function<uint64_t()>;
+
+  /*!
    * \brief Routes all library log output through the given callback instead
    * of stdout/stderr. Pass an empty callback to restore the default
    * behavior. The callback is invoked from the calling thread, including the
@@ -144,6 +149,32 @@ public:
   {
     std::lock_guard<std::mutex> lock(m_log_mutex);
     m_log_callback = std::move(callback);
+  }
+
+  /*!
+   * \brief Routes all library time requests through the given callback instead
+   * of std::chrono. Useful for providing simulated time from a host framework.
+   *
+   * \param callback Time callback returning nanoseconds since epoch
+   */
+  void setTimeCallback(TimeCallbackT callback)
+  {
+    std::lock_guard<std::mutex> lock(m_time_mutex);
+    m_time_callback = std::move(callback);
+  }
+
+  /*!
+   * \brief Gets the current time in nanoseconds
+   */
+  uint64_t getTimeNow() const
+  {
+    std::lock_guard<std::mutex> lock(m_time_mutex);
+    if (m_time_callback)
+    {
+      return m_time_callback();
+    }
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::high_resolution_clock::now().time_since_epoch()).count();
   }
 
   VDBMapping()                  = delete;
@@ -178,9 +209,9 @@ public:
   }
 
   /*!
-   * \brief Destructor that tears down all threads
+   * \brief Stop all background worker threads explicitly
    */
-  virtual ~VDBMapping()
+  void stop()
   {
     m_thread_stop_signal = true;
     for (auto& [source_id, worker_thread] : m_worker_threads)
@@ -202,6 +233,14 @@ public:
     {
       m_integration_thread.join();
     }
+  }
+
+  /*!
+   * \brief Destructor that tears down all threads
+   */
+  virtual ~VDBMapping()
+  {
+    stop();
   }
 
   /*!
@@ -252,8 +291,7 @@ public:
    */
   std::string timestampedMapPath(const std::string& suffix) const
   {
-    auto timestamp     = std::chrono::system_clock::now();
-    std::time_t now_tt = std::chrono::system_clock::to_time_t(timestamp);
+    std::time_t now_tt = static_cast<std::time_t>(getTimeNow() / 1000000000ULL);
     std::tm tm{};
     localtime_r(&now_tt, &tm);
     std::stringstream sstime;
@@ -302,7 +340,7 @@ public:
   {
     std::string pcd_path = timestampedMapPath("_active_values_map.pcd");
 
-    PointCloudT::Ptr cloud(new PointCloudT);
+    typename PointCloudT::Ptr cloud(new PointCloudT);
 
     std::shared_lock map_lock(*m_map_mutex);
     cloud->points.reserve(m_vdb_grid->activeVoxelCount());
@@ -422,7 +460,7 @@ public:
    */
   bool loadMapFromPCD(const std::string& file_path, const bool set_background, const bool clear_map)
   {
-    PointCloudT::Ptr cloud(new PointCloudT);
+    typename PointCloudT::Ptr cloud(new PointCloudT);
     if (pcl::io::loadPCDFile<PointT>(file_path, *cloud) == -1)
     {
       logMessage(LogLevel::Error, "Could not open PCD file " + file_path);
@@ -444,7 +482,7 @@ public:
    * \param origin Sensor position in map coordinates
    * \param source_id Specifies the input source
    */
-  void accumulateUpdate(const PointCloudT::ConstPtr& cloud,
+  void accumulateUpdate(const typename PointCloudT::ConstPtr& cloud,
                         const Eigen::Matrix<double, 3, 1>& origin,
                         const std::string source_id)
   {
@@ -496,7 +534,7 @@ public:
    * \param origin Sensor position in map coordinates
    * \param source_id Specifies the input source
    */
-  void addDataToAccumulate(const PointCloudT::ConstPtr& cloud,
+  void addDataToAccumulate(const typename PointCloudT::ConstPtr& cloud,
                            const Eigen::Matrix<double, 3, 1>& origin,
                            const std::string source_id)
   {
@@ -554,7 +592,7 @@ public:
    *
    * \returns Was the insertion of the new pointcloud successful
    */
-  bool insertPointCloud(const PointCloudT::ConstPtr& cloud,
+  bool insertPointCloud(const typename PointCloudT::ConstPtr& cloud,
                         const Eigen::Matrix<double, 3, 1>& origin,
                         const std::string source_id)
   {
@@ -568,7 +606,7 @@ public:
    *
    * \param cloud Input point cloud that should be removed
    */
-  bool removePointsFromGrid(const PointCloudT::ConstPtr& cloud)
+  bool removePointsFromGrid(const typename PointCloudT::ConstPtr& cloud)
   {
     // setNodeToFree writes m_min_logodds, which is uninitialized until
     // setConfig has run; reject the call instead of storing garbage.
@@ -606,7 +644,7 @@ public:
    *
    * \param cloud Input point cloud that should be added
    */
-  bool addPointsToGrid(const PointCloudT::ConstPtr& cloud)
+  bool addPointsToGrid(const typename PointCloudT::ConstPtr& cloud)
   {
     // setNodeToOccupied writes m_max_logodds, which is uninitialized until
     // setConfig has run; reject the call instead of storing garbage.
@@ -656,7 +694,7 @@ public:
    * \returns Raycasting successful
    */
   bool raycastPointCloud(
-    const PointCloudT::ConstPtr& cloud,
+    const typename PointCloudT::ConstPtr& cloud,
     const Eigen::Matrix<double, 3, 1>& origin,
     const double raycast_range,
     UpdateGridT::Accessor& update_grid_acc,
@@ -1193,7 +1231,7 @@ public:
                           const Eigen::Matrix<double, 4, 4>& map_to_reference_tf,
                           const bool full_grid = false) const
   {
-    return getMapSection<typename VDBMapping<TData, TConfig>::UpdateGridT>(
+    return getMapSection<typename VDBMapping<TData, TConfig, PointT>::UpdateGridT>(
       min_boundary, max_boundary, map_to_reference_tf, full_grid);
   }
   /*!
@@ -1211,7 +1249,7 @@ public:
                                         const Eigen::Matrix<double, 4, 4>& map_to_reference_tf,
                                         const bool full_grid = false) const
   {
-    return getMapSection<typename VDBMapping<TData, TConfig>::GridT>(
+    return getMapSection<typename VDBMapping<TData, TConfig, PointT>::GridT>(
       min_boundary, max_boundary, map_to_reference_tf, full_grid);
   }
   /*!
@@ -1946,7 +1984,7 @@ public:
     }
     while (!m_thread_stop_signal)
     {
-      auto sleep_time = std::chrono::high_resolution_clock::now() + source->max_input_period;
+      uint64_t sleep_time = getTimeNow() + std::chrono::duration_cast<std::chrono::nanoseconds>(source->max_input_period).count();
       std::unique_lock lock(source->input_data_mutex);
       source->data_available_cv.wait(lock,
                                      [&] { return source->input_data || m_thread_stop_signal; });
@@ -1962,7 +2000,7 @@ public:
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         continue;
       }
-      std::pair<PointCloudT::ConstPtr, Eigen::Matrix<double, 3, 1> > measurement;
+      std::pair<typename PointCloudT::ConstPtr, Eigen::Matrix<double, 3, 1> > measurement;
       measurement = *source->input_data;
       source->input_data.reset();
       lock.unlock();
@@ -1983,8 +2021,7 @@ public:
     }
     while (!m_thread_stop_signal)
     {
-      auto sleeping_time = std::chrono::high_resolution_clock::now() +
-                           std::chrono::milliseconds(m_accumulation_period.load());
+      uint64_t sleeping_time = getTimeNow() + (static_cast<uint64_t>(m_accumulation_period.load()) * 1000000ULL);
       integrateUpdate();
       sleepUntilOrStop(sleeping_time);
     }
@@ -1995,11 +2032,11 @@ public:
    * \brief Sleeps until the given time point, waking up early when the stop
    * signal is set so object destruction is not delayed by a full period
    *
-   * \param until Time point to sleep until
+   * \param until_ns Time point to sleep until (in nanoseconds)
    */
-  void sleepUntilOrStop(const std::chrono::high_resolution_clock::time_point& until) const
+  void sleepUntilOrStop(uint64_t until_ns) const
   {
-    while (!m_thread_stop_signal && std::chrono::high_resolution_clock::now() < until)
+    while (!m_thread_stop_signal && getTimeNow() < until_ns)
     {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
@@ -2143,7 +2180,7 @@ protected:
     return false;
   }
 
-  virtual bool createMapFromPointCloud([[maybe_unused]] const PointCloudT::Ptr& cloud,
+  virtual bool createMapFromPointCloud([[maybe_unused]] const typename PointCloudT::Ptr& cloud,
                                        [[maybe_unused]] const bool set_background,
                                        [[maybe_unused]] const bool clear_map)
   {
@@ -2217,6 +2254,16 @@ protected:
    * \brief Serializes log callback invocation and replacement
    */
   mutable std::mutex m_log_mutex;
+
+  /*!
+   * \brief Optional time callback; when unset, uses std::chrono
+   */
+  TimeCallbackT m_time_callback;
+
+  /*!
+   * \brief Serializes time callback invocation and replacement
+   */
+  mutable std::mutex m_time_mutex;
 
   /*!
    * \brief Map mutex for the map grid

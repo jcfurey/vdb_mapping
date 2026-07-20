@@ -848,6 +848,38 @@ TEST(Mapping, ClampMustStrictlyEncloseThresholds)
   EXPECT_EQ(errors.size(), 1u);
 }
 
+TEST(Mapping, ExplicitStopStopsThreads)
+{
+  OccupancyVDBMapping map(1);
+  Config conf;
+  conf.max_range = 10;
+  map.setConfig(conf);
+  map.addInputSource("test", conf.max_range, 10.0);
+  
+  // Explicitly call stop. If the threads don't join correctly, this will hang.
+  map.stop();
+  SUCCEED();
+}
+
+TEST(Mapping, TimeCallbackOverridesSystemTime)
+{
+  OccupancyVDBMapping map(1);
+  Config conf;
+  conf.map_directory_path = "/tmp";
+  map.setConfig(conf);
+
+  // Provide a fake time callback returning exactly 1 billion seconds since epoch
+  // (September 9, 2001) in nanoseconds.
+  uint64_t simulated_time_ns = 1000000000ULL * 1000000000ULL;
+  map.setTimeCallback([&]() { return simulated_time_ns; });
+
+  std::string path = map.timestampedMapPath("_test.vdb");
+  
+  // Check if the generated path contains "2001-09-0" (Day could be 8 or 9 depending on timezone)
+  EXPECT_TRUE(path.find("2001-09-0") != std::string::npos);
+  EXPECT_TRUE(path.find("_test.vdb") != std::string::npos);
+}
+
 } // namespace vdb_mapping
 
 int main(int argc, char** argv)

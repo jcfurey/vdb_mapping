@@ -55,11 +55,15 @@ struct Config : BaseConfig
   double prob_clamp_max = 0.99;
 };
 
-class OccupancyVDBMapping : public VDBMapping<float, Config>
+template <typename PointT = pcl::PointXYZ>
+class OccupancyVDBMappingT : public VDBMapping<float, Config, PointT>
 {
 public:
-  OccupancyVDBMapping(const double resolution)
-    : VDBMapping<float, Config>(resolution)
+  using PointCloudT = typename VDBMapping<float, Config, PointT>::PointCloudT;
+  using GridT = typename VDBMapping<float, Config, PointT>::GridT;
+
+  OccupancyVDBMappingT(const double resolution)
+    : VDBMapping<float, Config, PointT>(resolution)
   {
   }
 
@@ -75,14 +79,14 @@ public:
     // the boundary produce NaN/inf log odds that poison every voxel update.
     if (!(config.prob_miss > 0.0 && config.prob_miss <= 0.5))
     {
-      logMessage(LogLevel::Error,
+      this->logMessage(VDBMapping<float, Config, PointT>::LogLevel::Error,
                  "Probability for a miss should be in (0, 0.5] but is " +
                    std::to_string(config.prob_miss));
       return;
     }
     if (!(config.prob_hit >= 0.5 && config.prob_hit < 1.0))
     {
-      logMessage(LogLevel::Error,
+      this->logMessage(VDBMapping<float, Config, PointT>::LogLevel::Error,
                  "Probability for a hit should be in [0.5, 1) but is " +
                    std::to_string(config.prob_hit));
       return;
@@ -90,7 +94,7 @@ public:
     if (!(config.prob_thres_min > 0.0 && config.prob_thres_max < 1.0 &&
           config.prob_thres_min < config.prob_thres_max))
     {
-      logMessage(LogLevel::Error,
+      this->logMessage(VDBMapping<float, Config, PointT>::LogLevel::Error,
                  "Probability thresholds must satisfy 0 < min < max < 1 but are min=" +
                    std::to_string(config.prob_thres_min) +
                    " max=" + std::to_string(config.prob_thres_max));
@@ -104,7 +108,7 @@ public:
     if (!(config.prob_clamp_min > 0.0 && config.prob_clamp_min < config.prob_thres_min &&
           config.prob_clamp_max < 1.0 && config.prob_clamp_max > config.prob_thres_max))
     {
-      logMessage(LogLevel::Error,
+      this->logMessage(VDBMapping<float, Config, PointT>::LogLevel::Error,
                  "Clamping bounds must satisfy 0 < clamp_min < thres_min and thres_max < "
                  "clamp_max < 1 but are clamp_min=" +
                    std::to_string(config.prob_clamp_min) +
@@ -113,7 +117,7 @@ public:
     }
 
     // call base class function after validation passes
-    VDBMapping::setConfig(config);
+    VDBMapping<float, Config, PointT>::setConfig(config);
 
     // Store probabilities as log odds
     m_logodds_miss = static_cast<float>(log(config.prob_miss) - log(1 - config.prob_miss));
@@ -199,23 +203,23 @@ protected:
     return true;
   }
 
-  inline bool createMapFromPointCloud(const PointCloudT::Ptr& cloud,
+  inline bool createMapFromPointCloud(const typename PointCloudT::Ptr& cloud,
                                       const bool set_background,
                                       const bool clear_map) override
   {
-    if (!m_config_set)
+    if (!this->m_config_set)
     {
       // The log-odds members are uninitialized until setConfig has run;
       // writing them into the grid would store garbage values.
-      logMessage(LogLevel::Error, "Map not properly configured. Did you call setConfig method?");
+      this->logMessage(VDBMapping<float, Config, PointT>::LogLevel::Error, "Map not properly configured. Did you call setConfig method?");
       return false;
     }
     if (clear_map)
     {
-      m_vdb_grid->clear();
+      this->m_vdb_grid->clear();
     }
 
-    typename GridT::Accessor acc = m_vdb_grid->getAccessor();
+    typename GridT::Accessor acc = this->m_vdb_grid->getAccessor();
 
     for (const auto& point : cloud->points)
     {
@@ -236,16 +240,16 @@ protected:
       // and allocated leaf nodes for the entire box. sparseFill overwrites
       // everything inside the box, so stash the occupied voxels and restore
       // them afterwards.
-      openvdb::CoordBBox bbox = m_vdb_grid->evalActiveVoxelBoundingBox();
+      openvdb::CoordBBox bbox = this->m_vdb_grid->evalActiveVoxelBoundingBox();
 
       std::vector<std::pair<openvdb::Coord, float> > active_voxels;
-      active_voxels.reserve(m_vdb_grid->activeVoxelCount());
-      for (auto iter = m_vdb_grid->cbeginValueOn(); iter; ++iter)
+      active_voxels.reserve(this->m_vdb_grid->activeVoxelCount());
+      for (auto iter = this->m_vdb_grid->cbeginValueOn(); iter; ++iter)
       {
         active_voxels.emplace_back(iter.getCoord(), iter.getValue());
       }
 
-      m_vdb_grid->sparseFill(bbox, m_min_logodds, false);
+      this->m_vdb_grid->sparseFill(bbox, m_min_logodds, false);
 
       for (const auto& [coord, value] : active_voxels)
       {
@@ -253,7 +257,7 @@ protected:
       }
     }
 
-    m_vdb_grid->pruneGrid();
+    this->m_vdb_grid->pruneGrid();
     return true;
   }
 
@@ -292,6 +296,7 @@ protected:
   float m_min_logodds = 0.0f;
 };
 
+using OccupancyVDBMapping = OccupancyVDBMappingT<pcl::PointXYZ>;
 
 } // namespace vdb_mapping
 
