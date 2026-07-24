@@ -1,6 +1,10 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: MPL-2.0
 #
+if(POLICY CMP0167)
+  cmake_policy(SET CMP0167 NEW)
+endif()
+
 #[=======================================================================[.rst:
 
 FindOpenVDB
