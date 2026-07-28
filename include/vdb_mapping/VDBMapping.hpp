@@ -2036,8 +2036,21 @@ public:
    */
   void sleepUntilOrStop(uint64_t until_ns) const
   {
-    while (!m_thread_stop_signal && getTimeNow() < until_ns)
+    uint64_t previous_now = getTimeNow();
+    while (!m_thread_stop_signal)
     {
+      const uint64_t current_now = getTimeNow();
+      if (current_now >= until_ns)
+      {
+        break;
+      }
+      // ROS time can jump backwards during bag seek/loop. A deadline from the
+      // old epoch must not freeze this worker until replay catches back up.
+      if (current_now < previous_now)
+      {
+        break;
+      }
+      previous_now = current_now;
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
   }
