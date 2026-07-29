@@ -13,7 +13,7 @@
   <author email="grosse@fzi.de">Marvin Große Besselmann</author>
   <author email="puck@fzi.de">Lennart Puck</author>
 
-  <buildtool_depend>cmake</buildtool_depend>
+  <buildtool_depend>ament_cmake_auto</buildtool_depend>
 
   <depend>eigen</depend>
   <depend>libopenvdb-dev</depend>
@@ -24,6 +24,6 @@
   <test_depend>libgtest-dev</test_depend>
 
   <export>
-    <build_type>cmake</build_type>
+    <build_type>ament_cmake</build_type>
   </export>
 </package>

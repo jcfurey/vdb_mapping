@@ -3,6 +3,9 @@ set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules" ${CMAKE_MODULE_
 
 project(vdb_mapping VERSION 0.1.0 LANGUAGES CXX C)
 
+find_package(ament_cmake_auto REQUIRED)
+ament_auto_find_build_dependencies()
+
 include(CTest)
 option(BUILDING_TESTS "Build unit tests." ${BUILD_TESTING})
 
@@ -64,18 +67,11 @@ endif()
 #############
 
 install(TARGETS ${PROJECT_NAME}
-  EXPORT ${PROJECT_NAME}_targets
+  EXPORT export_${PROJECT_NAME}
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin
   INCLUDES DESTINATION include
-)
-
-install(
-  EXPORT ${PROJECT_NAME}_targets
-  DESTINATION lib/cmake/${PROJECT_NAME}
-  FILE ${PROJECT_NAME}Targets.cmake
-  NAMESPACE ${PROJECT_NAME}::
 )
 
 ## Mark cpp header files for installation
@@ -87,16 +83,16 @@ install(
   PATTERN "*.hpp"
 )
 
-include(CMakePackageConfigHelpers)
-write_basic_package_version_file(${PROJECT_NAME}ConfigVersion.cmake VERSION ${PROJECT_VERSION}
-  COMPATIBILITY SameMajorVersion)
 install(
   FILES
-    ${PROJECT_NAME}Config.cmake ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}ConfigVersion.cmake
     CMakeModules/FindOpenVDB.cmake
     CMakeModules/OpenVDBUtils.cmake
     CMakeModules/FindBlosc.cmake
     CMakeModules/FindZSTD.cmake
   DESTINATION
-    lib/cmake/${PROJECT_NAME}
+    share/${PROJECT_NAME}/cmake
 )
+
+ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
+ament_export_dependencies(Eigen3 OpenVDB PCL TBB ZSTD)
+ament_auto_package(CONFIG_EXTRAS cmake/vdb_mapping-extras.cmake)

@@ -173,8 +173,11 @@ public:
     {
       return m_time_callback();
     }
+    // Standalone (non-ROS) callers need epoch time for timestamped map
+    // filenames. ROS hosts install a callback backed by the node clock, so
+    // replay scheduling and filenames follow /clock there.
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
-      std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+      std::chrono::system_clock::now().time_since_epoch()).count();
   }
 
   VDBMapping()                  = delete;
