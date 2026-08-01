@@ -1,5 +1,6 @@
 #include "gtest/gtest.h"
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <vdb_mapping/OccupancyVDBMapping.hpp>
@@ -878,6 +879,134 @@ TEST(Mapping, TimeCallbackOverridesSystemTime)
   // Check if the generated path contains "2001-09-0" (Day could be 8 or 9 depending on timezone)
   EXPECT_TRUE(path.find("2001-09-0") != std::string::npos);
   EXPECT_TRUE(path.find("_test.vdb") != std::string::npos);
+}
+
+// The shipped Config must activate a persistently observed obstacle on the
+// FIRST hit. The old 0.12/0.97 defaults (OctoMap's clamping bounds misused
+// as activation thresholds) needed ~5 accumulation windows before a wall
+// appeared at all; every other test overrides the thresholds, so only this
+// one exercises what a defaults-trusting deployment actually gets.
+TEST(Mapping, DefaultConfigActivatesOnFirstHit)
+{
+  const double resolution = 0.1;
+  OccupancyVDBMapping map(resolution);
+  Config conf;
+  conf.max_range = 10;
+  conf.fast_mode = false;
+  map.setConfig(conf);
+  map.addInputSource("test", conf.max_range, 0);
+
+  OccupancyVDBMapping::PointCloudT::Ptr cloud(new OccupancyVDBMapping::PointCloudT);
+  cloud->points.emplace_back(0, 0, 5 * resolution);
+  Eigen::Matrix<double, 3, 1> origin(0, 0, 0);
+  map.insertPointCloud(cloud, origin, "test");
+
+  OccupancyVDBMapping::GridT::Accessor acc = map.getGrid()->getAccessor();
+  EXPECT_TRUE(acc.isValueOn(openvdb::Coord(0, 0, 5)));
+  EXPECT_FALSE(acc.isValueOn(openvdb::Coord(0, 0, 2)));
+}
+
+// Peer section updates must be able to clear regions that integration has
+// pruned into uniform TILES; the clearing pass used to walk leaves only.
+TEST(Mapping, SectionApplyClearsPrunedTiles)
+{
+  OccupancyVDBMapping map(0.1);
+  Config conf;
+  conf.max_range      = 10;
+  conf.fast_mode      = false;
+  conf.prob_thres_max = 0.51;
+  conf.prob_thres_min = 0.49;
+  map.setConfig(conf);
+
+  {
+    OccupancyVDBMapping::GridT::Accessor acc = map.getGrid()->getAccessor();
+    for (int x = 0; x < 8; ++x)
+      for (int y = 0; y < 8; ++y)
+        for (int z = 0; z < 8; ++z)
+          acc.setValueOn(openvdb::Coord(x, y, z), 3.0F);
+  }
+  map.getGrid()->pruneGrid();
+  ASSERT_EQ(map.getGrid()->tree().leafCount(), 0U);
+  ASSERT_TRUE(map.getGrid()->getAccessor().isValueOn(openvdb::Coord(3, 3, 3)));
+
+  // an empty section covering the block: everything inside must deactivate
+  auto section = OccupancyVDBMapping::UpdateGridT::create(false);
+  section->insertMeta("bb_min", openvdb::Vec3DMetadata(openvdb::Vec3d(0, 0, 0)));
+  section->insertMeta("bb_max", openvdb::Vec3DMetadata(openvdb::Vec3d(7, 7, 7)));
+  map.applyMapSectionUpdateGrid(section);
+
+  OccupancyVDBMapping::GridT::Accessor acc = map.getGrid()->getAccessor();
+  for (int x = 0; x < 8; ++x)
+    for (int y = 0; y < 8; ++y)
+      for (int z = 0; z < 8; ++z)
+        EXPECT_FALSE(acc.isValueOn(openvdb::Coord(x, y, z)));
+}
+
+namespace {
+class ProbeMap : public OccupancyVDBMapping
+{
+public:
+  explicit ProbeMap(double resolution)
+    : OccupancyVDBMapping(resolution)
+  {
+  }
+  void applyOverride(double hit, double miss)
+  {
+    applySourceProbabilityOverride(hit, miss);
+  }
+  void clearOverride() { clearSourceProbabilityOverride(); }
+  float logoddsHit() const { return m_logodds_hit; }
+  float logoddsMiss() const { return m_logodds_miss; }
+  void sleepFor(uint64_t until_ns, uint64_t max_expected_ns)
+  {
+    sleepUntilOrStop(until_ns, max_expected_ns);
+  }
+};
+}  // namespace
+
+// A per-source override must obey the same directional bounds as setConfig:
+// hits reinforce, misses erode. Inverted values are ignored, valid ones
+// apply, and clear restores the map-wide pair.
+TEST(Mapping, SourceOverrideRejectsInvertedProbabilities)
+{
+  ProbeMap map(0.1);
+  Config conf;
+  conf.max_range      = 10;
+  conf.fast_mode      = false;
+  conf.prob_hit       = 0.9;
+  conf.prob_miss      = 0.1;
+  conf.prob_thres_max = 0.51;
+  conf.prob_thres_min = 0.49;
+  map.setConfig(conf);
+  const auto log_hit  = static_cast<float>(log(0.9) - log(1 - 0.9));
+  const auto log_miss = static_cast<float>(log(0.1) - log(1 - 0.1));
+
+  map.applyOverride(0.3, 0.7);  // both inverted -> both ignored
+  EXPECT_FLOAT_EQ(map.logoddsHit(), log_hit);
+  EXPECT_FLOAT_EQ(map.logoddsMiss(), log_miss);
+  map.clearOverride();
+
+  map.applyOverride(0.8, 0.2);  // both valid -> both applied
+  EXPECT_FLOAT_EQ(map.logoddsHit(), static_cast<float>(log(0.8) - log(1 - 0.8)));
+  EXPECT_FLOAT_EQ(map.logoddsMiss(), static_cast<float>(log(0.2) - log(1 - 0.2)));
+  map.clearOverride();
+  EXPECT_FLOAT_EQ(map.logoddsHit(), log_hit);
+  EXPECT_FLOAT_EQ(map.logoddsMiss(), log_miss);
+}
+
+// A deadline computed under one clock epoch and slept under another (the
+// time callback installed in between) must not freeze the worker until the
+// new epoch reaches the old one — the caller's intended period bounds it.
+TEST(Mapping, SleepEpochShiftDoesNotFreeze)
+{
+  ProbeMap map(0.1);
+  map.setTimeCallback([]() -> uint64_t { return 1000000ULL; });  // sim epoch
+  const uint64_t wall_epoch_deadline = 1700000000ULL * 1000000000ULL;
+  const auto t0 = std::chrono::steady_clock::now();
+  map.sleepFor(wall_epoch_deadline, 100ULL * 1000000ULL);  // intended 100 ms
+  const double waited =
+    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  EXPECT_LT(waited, 2.0);
 }
 
 } // namespace vdb_mapping

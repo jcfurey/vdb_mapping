@@ -502,7 +502,14 @@ public:
     std::unique_lock update_grid_lock(source->second->update_grid_mutex);
     UpdateGridT::Accessor update_grid_acc = source->second->update_grid->getAccessor();
 
-    if (source->second->max_range > 0)
+    // Resolve the map-wide fallback at USE time as well as at registration:
+    // a source registered before setConfig() resolved its fallback against
+    // m_max_range == 0 and stayed dead forever, even after a valid config
+    // arrived.
+    const double map_max_range      = m_max_range;
+    const double effective_max_range =
+      source->second->max_range > 0 ? source->second->max_range : map_max_range;
+    if (effective_max_range > 0)
     {
       // A source registered after the map became non-empty has no
       // intersector until the next integration cycle. Fall back to the
@@ -511,7 +518,7 @@ public:
       {
         raycastPointCloud(cloud,
                           origin,
-                          source->second->max_range,
+                          effective_max_range,
                           update_grid_acc,
                           source->second->volume_ray_intersector,
                           source->second->ray_clearing,
@@ -521,7 +528,7 @@ public:
       {
         raycastPointCloud(cloud,
                           origin,
-                          source->second->max_range,
+                          effective_max_range,
                           update_grid_acc,
                           std::nullopt,
                           source->second->ray_clearing,
@@ -1558,6 +1565,31 @@ public:
         }
       }
     }
+    // Integration prunes uniform leaves into active TILES every cycle, and
+    // tiles are invisible to the leaf walk above — without this pass a
+    // pruned occupied block inside the section could never be cleared by a
+    // peer update. Deactivating through the accessor densifies the tile
+    // back into voxels for exactly the overlap region.
+    auto tile_iter = m_vdb_grid->tree().cbeginValueOn();
+    tile_iter.setMaxDepth(GridT::TreeType::DEPTH - 2);
+    for (; tile_iter; ++tile_iter)
+    {
+      if (!tile_iter.isTileValue())
+      {
+        continue;
+      }
+      openvdb::CoordBBox tile_bbox;
+      tile_iter.getBoundingBox(tile_bbox);
+      if (!tile_bbox.hasOverlap(bbox))
+      {
+        continue;
+      }
+      tile_bbox.intersect(bbox);
+      for (auto coord_iter = tile_bbox.begin(); coord_iter != tile_bbox.end(); ++coord_iter)
+      {
+        acc.setActiveState(*coord_iter, false);
+      }
+    }
     for (auto iter = section->cbeginValueOn(); iter; ++iter)
     {
       acc.setActiveState(iter.getCoord(), true);
@@ -2024,9 +2056,11 @@ public:
     }
     while (!m_thread_stop_signal)
     {
-      uint64_t sleeping_time = getTimeNow() + (static_cast<uint64_t>(m_accumulation_period.load()) * 1000000ULL);
+      const uint64_t period_ns =
+        static_cast<uint64_t>(m_accumulation_period.load()) * 1000000ULL;
+      uint64_t sleeping_time = getTimeNow() + period_ns;
       integrateUpdate();
-      sleepUntilOrStop(sleeping_time);
+      sleepUntilOrStop(sleeping_time, period_ns);
     }
     logMessage(LogLevel::Info, "Integration thread received stop signal");
   }
@@ -2036,14 +2070,25 @@ public:
    * signal is set so object destruction is not delayed by a full period
    *
    * \param until_ns Time point to sleep until (in nanoseconds)
+   * \param max_expected_ns Longest sleep the caller intended (0 = no bound).
+   * A remaining sleep beyond this means the deadline and the current clock
+   * come from different epochs (e.g. the time callback was installed after
+   * the deadline was computed) — bail out instead of freezing until the new
+   * epoch catches up to the old one.
    */
-  void sleepUntilOrStop(uint64_t until_ns) const
+  void sleepUntilOrStop(uint64_t until_ns, uint64_t max_expected_ns = 0) const
   {
     uint64_t previous_now = getTimeNow();
     while (!m_thread_stop_signal)
     {
       const uint64_t current_now = getTimeNow();
       if (current_now >= until_ns)
+      {
+        break;
+      }
+      // Epoch shift BEFORE entry: the backwards-jump guard below only sees
+      // jumps between its own iterations.
+      if (max_expected_ns > 0 && until_ns - current_now > max_expected_ns)
       {
         break;
       }
@@ -2122,7 +2167,10 @@ public:
     m_max_range           = config.max_range;
     m_map_directory_path  = config.map_directory_path;
     m_fast_mode           = config.fast_mode;
-    m_accumulation_period = (int)(config.accumulation_period * 1000);
+    // Floor at 1 ms: (0, 1ms) truncated to 0 and busy-spun the integration
+    // thread while it held the unique map lock.
+    m_accumulation_period =
+      std::max(1, static_cast<int>(config.accumulation_period * 1000));
     m_config_set          = true;
   }
 
