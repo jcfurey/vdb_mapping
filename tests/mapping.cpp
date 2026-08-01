@@ -902,6 +902,12 @@ struct TwoSourceMap
     conf.prob_thres_max = 0.51;
     conf.prob_thres_min = 0.49;
     map.setConfig(conf);
+    // The integration thread's FIRST tick runs immediately after setConfig,
+    // before its first sleep — it raced the synchronous feed/integrate
+    // pairs below and could consume a fed update grid early (observed as a
+    // flaky hit+miss where a lone hit belongs). These tests are strictly
+    // synchronous: stop the background threads outright.
+    map.stop();
     log_hit  = static_cast<float>(log(conf.prob_hit) - log(1 - conf.prob_hit));
     log_miss = static_cast<float>(log(conf.prob_miss) - log(1 - conf.prob_miss));
   }
@@ -1096,6 +1102,69 @@ TEST(Mapping, WorldToIndexRoundsToNearestVoxelCenter)
   EXPECT_TRUE(acc.isValueOn(openvdb::Coord(3, 0, 6)));
 }
 
+// A source registered BEFORE setConfig used to resolve its max_range
+// fallback against the unconfigured 0.0 and stay dead forever; the fallback
+// now re-resolves at use time.
+TEST(MappingSources, SourceRegisteredBeforeConfigComesAlive)
+{
+  OccupancyVDBMapping map(0.1);
+  map.addInputSource("early", 0, 0);  // fallback wanted, config not set yet
+  Config conf;
+  conf.max_range      = 10;
+  conf.fast_mode      = false;
+  conf.prob_hit       = 0.9;
+  conf.prob_miss      = 0.1;
+  conf.prob_thres_max = 0.51;
+  conf.prob_thres_min = 0.49;
+  map.setConfig(conf);
+  OccupancyVDBMapping::PointCloudT::Ptr c(new OccupancyVDBMapping::PointCloudT);
+  c->points.emplace_back(0, 0, 0.5);
+  Eigen::Matrix<double, 3, 1> origin(0, 0, 0);
+  map.accumulateUpdate(c, origin, "early");
+  map.integrateUpdate();
+  OccupancyVDBMapping::GridT::Accessor acc = map.getGrid()->getAccessor();
+  EXPECT_TRUE(acc.isValueOn(openvdb::Coord(0, 0, 5)))
+    << "source registered before setConfig stayed dead";
+}
+
+// The section READ side must extract regions that pruning collapsed into
+// active tiles; only the single-voxel (leaf) case was pinned before.
+TEST(Mapping, MapSectionExtractsPrunedTiles)
+{
+  OccupancyVDBMapping map(1);
+  Config conf;
+  conf.max_range      = 10;
+  conf.fast_mode      = false;
+  conf.prob_thres_max = 0.51;
+  conf.prob_thres_min = 0.49;
+  map.setConfig(conf);
+  // direct accessor writes below must not race the integration thread's
+  // immediate first tick (pruneGrid under the map lock)
+  map.stop();
+  {
+    OccupancyVDBMapping::GridT::Accessor acc = map.getGrid()->getAccessor();
+    for (int x = 0; x < 8; ++x)
+      for (int y = 0; y < 8; ++y)
+        for (int z = 0; z < 8; ++z)
+          acc.setValueOn(openvdb::Coord(x, y, z), 3.0F);
+  }
+  map.getGrid()->pruneGrid();
+  ASSERT_EQ(map.getGrid()->tree().leafCount(), 0U);
+
+  const Eigen::Matrix<double, 3, 1> lo(-0.5, -0.5, -0.5);
+  const Eigen::Matrix<double, 3, 1> hi(7.5, 7.5, 7.5);
+  const Eigen::Matrix<double, 4, 4> identity =
+    Eigen::Matrix<double, 4, 4>::Identity();
+  auto section = map.getMapSectionUpdateGrid(lo, hi, identity);
+  ASSERT_TRUE(section);
+  std::size_t active = 0;
+  for (auto iter = section->cbeginValueOn(); iter; ++iter)
+  {
+    ++active;
+  }
+  EXPECT_EQ(active, 512U) << "tile content missing from the extracted section";
+}
+
 // The shipped Config must activate a persistently observed obstacle on the
 // FIRST hit. The old 0.12/0.97 defaults (OctoMap's clamping bounds misused
 // as activation thresholds) needed ~5 accumulation windows before a wall
@@ -1132,6 +1201,9 @@ TEST(Mapping, SectionApplyClearsPrunedTiles)
   conf.prob_thres_max = 0.51;
   conf.prob_thres_min = 0.49;
   map.setConfig(conf);
+  // direct accessor writes below must not race the integration thread's
+  // immediate first tick (pruneGrid under the map lock)
+  map.stop();
 
   {
     OccupancyVDBMapping::GridT::Accessor acc = map.getGrid()->getAccessor();
