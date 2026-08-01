@@ -37,14 +37,21 @@ namespace vdb_mapping {
  *
  * The defaults follow the beam-based inverse sensor model parameters
  * published for OctoMap (Hornung et al., Auton. Robots 2013, Sect. 5.1):
- * P(hit) = 0.7, P(miss) = 0.4, with activation thresholds at 0.12 / 0.97.
+ * P(hit) = 0.7, P(miss) = 0.4, with activation thresholds at 0.49 / 0.51.
  */
 struct Config : BaseConfig
 {
   double prob_hit       = 0.7;
   double prob_miss      = 0.4;
-  double prob_thres_min = 0.12;
-  double prob_thres_max = 0.97;
+  /*!
+   * \brief Activation thresholds: a voxel turns occupied above thres_max and
+   * free below thres_min. NOT the OctoMap 0.12/0.97 pair — those are Eq. 4
+   * CLAMPING bounds (prob_clamp_* below); used as activation thresholds they
+   * cost ceil(logit(0.97)/logit(prob_hit)) ~ 5 accumulation windows of
+   * latency before a persistently observed obstacle appears at all.
+   */
+  double prob_thres_min = 0.49;
+  double prob_thres_max = 0.51;
   /*!
    * \brief Clamping bounds of the log-odds update (Yguel et al.'s clamping
    * update policy, see OctoMap Eq. 4). Tighter bounds let the map adapt to
@@ -119,6 +126,12 @@ public:
     // call base class function after validation passes
     VDBMapping<float, Config, PointT>::setConfig(config);
 
+    // Exclude the integration thread while the active log-odds change: it
+    // reads them under the exclusive map lock and swaps them around
+    // per-source overrides, so an unlocked write here could race — or land
+    // between apply/clear and be reverted wholesale by the pending restore.
+    std::unique_lock map_lock(*(this->m_map_mutex));
+
     // Store probabilities as log odds
     m_logodds_miss = static_cast<float>(log(config.prob_miss) - log(1 - config.prob_miss));
     m_logodds_hit  = static_cast<float>(log(config.prob_hit) - log(1 - config.prob_hit));
@@ -140,13 +153,30 @@ protected:
   {
     m_logodds_hit_default  = m_logodds_hit;
     m_logodds_miss_default = m_logodds_miss;
-    if (prob_hit > 0.0 && prob_hit < 1.0)
+    // Same directional bounds setConfig enforces: a hit must reinforce
+    // (>= 0.5) and a miss must erode (<= 0.5). Without this an inverted
+    // per-source override silently made "hits" erode and "misses"
+    // reinforce; <= 0 stays the documented keep-map-wide sentinel, and
+    // anything else is ignored LOUDLY instead of silently.
+    if (prob_hit >= 0.5 && prob_hit < 1.0)
     {
       m_logodds_hit = static_cast<float>(log(prob_hit) - log(1 - prob_hit));
     }
-    if (prob_miss > 0.0 && prob_miss < 1.0)
+    else if (prob_hit > 0.0)
+    {
+      this->logMessage(VDBMapping<float, Config, PointT>::LogLevel::Warning,
+                       "Ignoring per-source prob_hit " + std::to_string(prob_hit) +
+                         " outside [0.5, 1); keeping the map-wide value");
+    }
+    if (prob_miss > 0.0 && prob_miss <= 0.5)
     {
       m_logodds_miss = static_cast<float>(log(prob_miss) - log(1 - prob_miss));
+    }
+    else if (prob_miss > 0.0)
+    {
+      this->logMessage(VDBMapping<float, Config, PointT>::LogLevel::Warning,
+                       "Ignoring per-source prob_miss " + std::to_string(prob_miss) +
+                         " outside (0, 0.5]; keeping the map-wide value");
     }
   }
   void clearSourceProbabilityOverride() override
