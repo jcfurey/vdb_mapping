@@ -1,5 +1,6 @@
 #include "gtest/gtest.h"
 #include <array>
+#include <initializer_list>
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -879,6 +880,220 @@ TEST(Mapping, TimeCallbackOverridesSystemTime)
   // Check if the generated path contains "2001-09-0" (Day could be 8 or 9 depending on timezone)
   EXPECT_TRUE(path.find("2001-09-0") != std::string::npos);
   EXPECT_TRUE(path.find("_test.vdb") != std::string::npos);
+}
+
+namespace {
+// Shared fixture for the source-semantics tests below: 0.1 m grid, log-odds
+// pair (0.9 / 0.1), one-hit activation thresholds, synchronous accumulate ->
+// integrate (the same calls the ROS wrapper makes, minus the threads).
+struct TwoSourceMap
+{
+  static constexpr double kRes = 0.1;
+  OccupancyVDBMapping map{kRes};
+  float log_hit;
+  float log_miss;
+  TwoSourceMap(bool fast_mode = false)
+  {
+    Config conf;
+    conf.max_range      = 10;
+    conf.fast_mode      = fast_mode;
+    conf.prob_hit       = 0.9;
+    conf.prob_miss      = 0.1;
+    conf.prob_thres_max = 0.51;
+    conf.prob_thres_min = 0.49;
+    map.setConfig(conf);
+    log_hit  = static_cast<float>(log(conf.prob_hit) - log(1 - conf.prob_hit));
+    log_miss = static_cast<float>(log(conf.prob_miss) - log(1 - conf.prob_miss));
+  }
+  // the synchronous path the wrapper's deterministic mode uses
+  void feed(const OccupancyVDBMapping::PointCloudT::Ptr& c,
+            const Eigen::Matrix<double, 3, 1>& origin,
+            const std::string& source)
+  {
+    map.accumulateUpdate(c, origin, source);
+  }
+  static OccupancyVDBMapping::PointCloudT::Ptr cloud(
+    std::initializer_list<std::array<double, 3>> pts)
+  {
+    OccupancyVDBMapping::PointCloudT::Ptr c(new OccupancyVDBMapping::PointCloudT);
+    for (const auto& p : pts)
+    {
+      c->points.emplace_back(p[0], p[1], p[2]);
+    }
+    return c;
+  }
+};
+}  // namespace
+
+// The headline per-source feature had no tests at all: a clearing stream
+// (ray_clearing=true, endpoint_hits=false) must carve free space along the
+// ray INCLUDING its endpoint voxel, and register no hit anywhere.
+TEST(MappingSources, ClearingSourceCarvesWithoutHits)
+{
+  TwoSourceMap f;
+  f.map.addInputSource("clear", 10, 0, /*ray_clearing=*/true, /*endpoint_hits=*/false);
+  Eigen::Matrix<double, 3, 1> origin(0, 0, 0);
+  f.feed(f.cloud({{0, 0, 5 * f.kRes}}), origin, "clear");
+  f.map.integrateUpdate();
+  OccupancyVDBMapping::GridT::Accessor acc = f.map.getGrid()->getAccessor();
+  for (int i = 0; i <= 5; ++i)
+  {
+    EXPECT_EQ(acc.getValue(openvdb::Coord(0, 0, i)), f.log_miss)
+      << "voxel " << i;
+    EXPECT_FALSE(acc.isValueOn(openvdb::Coord(0, 0, i)));
+  }
+}
+
+// A hits-only source (ray_clearing=false) applies exactly one hit at the
+// endpoint and no misses; a beyond-range point contributes NOTHING (it is
+// not truncated into a free ray, because the source does not clear).
+TEST(MappingSources, HitsOnlySourceAndBeyondRange)
+{
+  TwoSourceMap f;
+  f.map.addInputSource("hits", 1.0, 0, /*ray_clearing=*/false, /*endpoint_hits=*/true);
+  Eigen::Matrix<double, 3, 1> origin(0, 0, 0);
+  f.feed(
+    f.cloud({{0, 0, 5 * f.kRes}, {0, 0, 5.0}}), origin, "hits");
+  f.map.integrateUpdate();
+  OccupancyVDBMapping::GridT::Accessor acc = f.map.getGrid()->getAccessor();
+  EXPECT_EQ(acc.getValue(openvdb::Coord(0, 0, 5)), f.log_hit);
+  EXPECT_TRUE(acc.isValueOn(openvdb::Coord(0, 0, 5)));
+  for (int i = 0; i < 5; ++i)
+  {
+    EXPECT_EQ(acc.getValue(openvdb::Coord(0, 0, i)), 0.0F) << "voxel " << i;
+  }
+  // the 5.0 m point sits beyond the source's 1.0 m max_range: no hit, and
+  // no free ray either
+  EXPECT_EQ(acc.getValue(openvdb::Coord(0, 0, 50)), 0.0F);
+  for (int i = 6; i <= 10; ++i)
+  {
+    EXPECT_EQ(acc.getValue(openvdb::Coord(0, 0, i)), 0.0F) << "voxel " << i;
+  }
+}
+
+// Hit-dominance only exists INSIDE one source. A hit source and a clearing
+// source touching the same cell in the same window both apply: the net is
+// exactly log_hit + log_miss, deterministically (sources iterate in
+// lexicographic order).
+TEST(MappingSources, CrossSourceHitAndClearSuperimpose)
+{
+  TwoSourceMap f;
+  f.map.addInputSource("hits", 10, 0, /*ray_clearing=*/true, /*endpoint_hits=*/true);
+  f.map.addInputSource("clear", 10, 0, /*ray_clearing=*/true, /*endpoint_hits=*/false);
+  Eigen::Matrix<double, 3, 1> origin(0, 0, 0);
+  // hit endpoint at z=5; clearing ray THROUGH it to z=8
+  f.feed(f.cloud({{0, 0, 5 * f.kRes}}), origin, "hits");
+  f.feed(f.cloud({{0, 0, 8 * f.kRes}}), origin, "clear");
+  f.map.integrateUpdate();
+  OccupancyVDBMapping::GridT::Accessor acc = f.map.getGrid()->getAccessor();
+  EXPECT_FLOAT_EQ(acc.getValue(openvdb::Coord(0, 0, 5)), f.log_hit + f.log_miss);
+  // cells only the clearing ray touched get a single miss
+  EXPECT_FLOAT_EQ(acc.getValue(openvdb::Coord(0, 0, 7)), f.log_miss);
+}
+
+// Per-source probability overrides must flow through the REAL integration
+// path (not just the protected setter): a weak-miss clearing source erodes
+// by its own log-odds while the map-wide pair stays in force for the other
+// source — and is restored afterwards.
+TEST(MappingSources, PerSourceOverrideAppliesThroughIntegration)
+{
+  TwoSourceMap f;
+  f.map.addInputSource("hits", 10, 0, true, true);
+  f.map.addInputSource("clear", 10, 0, true, false, -1.0, /*prob_miss=*/0.45);
+  Eigen::Matrix<double, 3, 1> origin(0, 0, 0);
+  f.feed(f.cloud({{0, 0, 5 * f.kRes}}), origin, "hits");
+  f.feed(f.cloud({{0, 0, 3 * f.kRes}}), origin, "clear");
+  f.map.integrateUpdate();
+  const float weak_miss = static_cast<float>(log(0.45) - log(1 - 0.45));
+  OccupancyVDBMapping::GridT::Accessor acc = f.map.getGrid()->getAccessor();
+  // z=3: crossed by the hit source's ray (map-wide miss) AND the clearing
+  // source's endpoint (weak miss)
+  EXPECT_FLOAT_EQ(acc.getValue(openvdb::Coord(0, 0, 3)), f.log_miss + weak_miss);
+  // z=5: hit at the map-wide log-odds — the override did not leak
+  EXPECT_FLOAT_EQ(acc.getValue(openvdb::Coord(0, 0, 5)), f.log_hit);
+}
+
+// fast_mode clearing only decrements voxels ALREADY occupied in the map;
+// unknown cells crossed by the ray stay untouched once the grid is
+// non-empty. (The audit's F5: free-vs-unknown consumers need fast_mode off.)
+TEST(MappingSources, FastModeClearsOnlyOccupied)
+{
+  TwoSourceMap f(/*fast_mode=*/true);
+  f.map.addInputSource("hits", 10, 0, true, true);
+  f.map.addInputSource("clear", 10, 0, true, false);
+  Eigen::Matrix<double, 3, 1> origin(0, 0, 0);
+  // window 1: a hit occupies z=5 (empty grid: exact DDA fallback runs)
+  f.feed(f.cloud({{0, 0, 5 * f.kRes}}), origin, "hits");
+  f.map.integrateUpdate();
+  OccupancyVDBMapping::GridT::Accessor acc0 = f.map.getGrid()->getAccessor();
+  ASSERT_TRUE(acc0.isValueOn(openvdb::Coord(0, 0, 5)));
+  const float after_hit = acc0.getValue(openvdb::Coord(0, 0, 5));
+  // window 2: clearing ray through z=5 to z=8
+  f.feed(f.cloud({{0, 0, 8 * f.kRes}}), origin, "clear");
+  f.map.integrateUpdate();
+  OccupancyVDBMapping::GridT::Accessor acc = f.map.getGrid()->getAccessor();
+  // the occupied cell was decremented...
+  EXPECT_FLOAT_EQ(acc.getValue(openvdb::Coord(0, 0, 5)), after_hit + f.log_miss);
+  // ...but non-occupied cells along the ray were NOT carved further:
+  // z=2 keeps only window 1's miss (the hit source's own ray, exact DDA on
+  // the then-empty grid) and z=7 stays untouched entirely
+  EXPECT_FLOAT_EQ(acc.getValue(openvdb::Coord(0, 0, 2)), f.log_miss);
+  EXPECT_EQ(acc.getValue(openvdb::Coord(0, 0, 7)), 0.0F);
+}
+
+// Two clouds accumulated into the same source before one integration merge
+// in the boolean update grid: each touched cell still gets exactly ONE
+// update, and a cell that is a hit endpoint in either cloud stays a hit
+// (value=true survives later setActiveState). The threaded mailbox
+// (addDataToAccumulate) is latest-wins on top of this and is exercised by
+// the wrapper, not here.
+TEST(MappingSources, SameSourceCloudsMergeWithHitDominance)
+{
+  TwoSourceMap f;
+  f.map.addInputSource("hits", 10, 0, true, true);
+  Eigen::Matrix<double, 3, 1> origin(0, 0, 0);
+  f.feed(f.cloud({{0, 0, 3 * f.kRes}}), origin, "hits");
+  f.feed(f.cloud({{0, 0, 5 * f.kRes}}), origin, "hits");
+  f.map.integrateUpdate();
+  OccupancyVDBMapping::GridT::Accessor acc = f.map.getGrid()->getAccessor();
+  // z=3 is the first cloud's hit endpoint AND on the second cloud's ray:
+  // hit dominates inside one source, exactly one update
+  EXPECT_FLOAT_EQ(acc.getValue(openvdb::Coord(0, 0, 3)), f.log_hit);
+  EXPECT_FLOAT_EQ(acc.getValue(openvdb::Coord(0, 0, 5)), f.log_hit);
+  EXPECT_FLOAT_EQ(acc.getValue(openvdb::Coord(0, 0, 1)), f.log_miss);
+}
+
+// N observations of one cell inside one cloud collapse to ONE log-odds
+// update: the update grid is boolean per window.
+TEST(MappingSources, WindowDedupesRepeatedHits)
+{
+  TwoSourceMap f;
+  f.map.addInputSource("hits", 10, 0, true, true);
+  Eigen::Matrix<double, 3, 1> origin(0, 0, 0);
+  f.feed(
+    f.cloud({{0, 0, 5 * f.kRes}, {0.02, 0.02, 5 * f.kRes}, {-0.02, 0.01, 5 * f.kRes}}),
+    origin, "hits");
+  f.map.integrateUpdate();
+  OccupancyVDBMapping::GridT::Accessor acc = f.map.getGrid()->getAccessor();
+  EXPECT_FLOAT_EQ(acc.getValue(openvdb::Coord(0, 0, 5)), f.log_hit);
+}
+
+// worldToIndex rounds to the nearest voxel center: 0.1 m resolution maps
+// [-0.05, 0.05) to index 0 on each axis.
+TEST(Mapping, WorldToIndexRoundsToNearestVoxelCenter)
+{
+  TwoSourceMap f;
+  f.map.addInputSource("hits", 10, 0, true, true);
+  Eigen::Matrix<double, 3, 1> origin(0, 0, -0.3);
+  // 0.549 rounds to index 5; 0.551 rounds to index 6
+  f.feed(f.cloud({{0, 0, 0.549}}), origin, "hits");
+  f.map.integrateUpdate();
+  f.feed(f.cloud({{0.3, 0, 0.551}}), origin, "hits");
+  f.map.integrateUpdate();
+  OccupancyVDBMapping::GridT::Accessor acc = f.map.getGrid()->getAccessor();
+  EXPECT_TRUE(acc.isValueOn(openvdb::Coord(0, 0, 5)));
+  EXPECT_FALSE(acc.isValueOn(openvdb::Coord(0, 0, 6)));
+  EXPECT_TRUE(acc.isValueOn(openvdb::Coord(3, 0, 6)));
 }
 
 // The shipped Config must activate a persistently observed obstacle on the
