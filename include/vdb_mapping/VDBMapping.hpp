@@ -2150,15 +2150,18 @@ public:
    * \brief Handles changing the mapping config
    *
    * \param config Configuration structure
+   * \returns false when the config was rejected and NOTHING was applied.
+   * Returning void here let a derived class apply its own half of the config
+   * after a base reject — a silently half-applied configuration.
    */
-  virtual void setConfig(const TConfig& config)
+  virtual bool setConfig(const TConfig& config)
   {
     if (config.max_range < 0.0)
     {
       logMessage(LogLevel::Error,
                  "Max range of " + std::to_string(config.max_range) +
                    " invalid. Range cannot be negative.");
-      return;
+      return false;
     }
     if (!(config.accumulation_period > 0.0))
     {
@@ -2168,7 +2171,7 @@ public:
       logMessage(LogLevel::Error,
                  "Accumulation period of " + std::to_string(config.accumulation_period) +
                    " invalid. Must be a positive number of seconds.");
-      return;
+      return false;
     }
     m_max_range           = config.max_range;
     m_map_directory_path  = config.map_directory_path;
@@ -2178,6 +2181,7 @@ public:
     m_accumulation_period =
       std::max(1, static_cast<int>(config.accumulation_period * 1000));
     m_config_set          = true;
+    return true;
   }
 
 protected:
