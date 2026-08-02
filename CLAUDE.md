@@ -15,16 +15,17 @@ vdb_mapping/
 │   └── OccupancyVDBMapping.hpp # Occupancy-specific subclass with log-odds probability updates
 ├── tests/
 │   ├── CMakeLists.txt          # Test build config (uses GTest)
-│   └── mapping.cpp             # Unit tests for OccupancyVDBMapping
+│   ├── mapping.cpp             # Unit tests (Mapping + MappingSources suites)
+│   └── tsan.supp               # ThreadSanitizer suppressions for race-checking the suite
 ├── CMakeModules/
 │   ├── FindOpenVDB.cmake       # Custom CMake find modules
 │   ├── FindBlosc.cmake
 │   ├── FindZSTD.cmake
 │   ├── FindGTestPackage.cmake
 │   └── OpenVDBUtils.cmake
-├── CMakeLists.txt              # Root build file
+├── CMakeLists.txt              # Root build file (ament_cmake_auto)
 ├── vdb_mappingConfig.cmake     # CMake package config for downstream consumers
-├── package.xml                 # ROS/ROS2 package manifest (build type: cmake, not catkin)
+├── package.xml                 # ROS/ROS2 package manifest (build type: ament_cmake)
 ├── .clang-format               # Code formatting rules
 ├── .gitlab-ci.yml              # CI pipeline config
 └── .gitignore
@@ -48,18 +49,23 @@ The library is entirely header-only with an `INTERFACE` CMake target. All code l
   - Grid serialization with ZSTD compression (`gridToByteArray`, `byteArrayToGrid`)
   - Batch and single raytracing queries (`raytrace`)
   - Multi-threaded accumulation pipeline with per-source worker threads and a dedicated integration thread
+  - Per-source integration semantics: registered sources may override `prob_hit`/`prob_miss` and select roles via `ray_clearing`/`endpoint_hits`; a per-source `max_range <= 0` falls back to the map-level `max_range` at use time (never latched at registration, so a source configured before the map cannot go permanently dead)
+  - Injectable time source (`setTimeCallback`) and explicit `stop()` for deterministic tests and replay
   - Thread-safe map access using `std::shared_mutex`
 
 - **`OccupancyVDBMapping`** (`OccupancyVDBMapping.hpp`) - Concrete subclass using `float` voxel data. Implements:
   - Log-odds probability updates for occupied/free nodes
-  - Clamping thresholds to maintain dynamic map behavior
-  - Config validation (hit probability > 0.5, miss probability < 0.5)
+  - Activation thresholds `prob_thres_min`/`prob_thres_max` (defaults **0.49/0.51** — a single clean hit activates). These are NOT the OctoMap 0.12/0.97 pair: those are log-odds CLAMPING bounds, kept separately as `prob_clamp_*`; used as activation thresholds they cost ~5 accumulation windows before an obstacle appears at all
+  - Config validation (hit probability > 0.5, miss probability < 0.5; clamping bounds must strictly enclose the activation thresholds)
   - Point cloud to map creation
 
 ### Key Types
 
 ```cpp
-using PointT      = pcl::PointXYZ;
+template <typename TData, typename TConfig = BaseConfig, typename PointType = pcl::PointXYZ>
+class VDBMapping;         // templatized on the point type since b8821d7
+
+using PointT      = PointType;                // pcl::PointXYZ by default
 using PointCloudT = pcl::PointCloud<PointT>;
 using GridT       = openvdb::Grid<openvdb::tree::Tree4<TData, 5, 4, 3>::Type>;
 using UpdateGridT = openvdb::Grid<openvdb::tree::Tree4<bool, 1, 4, 3>::Type>;
@@ -109,7 +115,7 @@ ctest
 
 ### ROS/ROS2 workspace
 
-This is a **cmake** package (not catkin). When building in a ROS workspace, use `catkin build` or `catkin_make_isolated` (not `catkin_make`). For ROS2, use `colcon build`.
+This is an **ament_cmake** package built with `ament_cmake_auto` (converted from plain cmake in f92fe50). In a ROS 2 workspace: `colcon build --packages-select vdb_mapping`. The standalone cmake build above still works, but needs the ROS 2 environment sourced so `ament_cmake_auto` resolves.
 
 ## CI/CD
 
@@ -170,17 +176,12 @@ Run formatting with: `clang-format -i <file>`
 
 ## Testing
 
-Tests use **Google Test (GTest)** and are located in `tests/mapping.cpp`. Current test cases:
+Tests use **Google Test (GTest)** and are located in `tests/mapping.cpp` — 44 tests in two suites, all built on `OccupancyVDBMapping` with log-odds verification:
 
-| Test Name | Description |
-|-----------|-------------|
-| `Mapping.SetConfig` | Validates config application and initial point cloud insertion |
-| `Mapping.InsertPositivePoint` | Verifies raycasting with a point along positive Z axis |
-| `Mapping.InsertNegativePoint` | Verifies raycasting with a point along negative Z axis |
-| `Mapping.InsertMaxRangePoint` | Verifies max range clipping behavior |
-| `Mapping.ResetMap` | Validates map clearing functionality |
+- **`Mapping`** — config validation and activation-threshold defaults (`DefaultConfigActivatesOnFirstHit`, `ConfigurableClampingBounds`, `ClampMustStrictlyEncloseThresholds`), insertion/raycasting on and off fast mode (including degenerate and non-finite inputs), serialization round-trips and garbage rejection, map sections with pruned tiles, morphological ops, cell-centered coordinate rounding, and threading/liveness (`ExplicitStopStopsThreads`, `TimeCallbackOverridesSystemTime`, `SleepEpochShiftDoesNotFreeze`).
+- **`MappingSources`** — the per-source semantics the sonar integration relies on: clearing-only sources carve without ever adding hits, hit-only sources with beyond-range behavior, cross-source superimposition, per-source overrides applying through integration, hit dominance when same-source clouds merge, window dedup of repeated hits, and `SourceRegisteredBeforeConfigComesAlive` (the use-time `max_range` fallback).
 
-All tests use `OccupancyVDBMapping` with log-odds probability verification.
+`tests/tsan.supp` carries ThreadSanitizer suppressions so the whole suite race-checks in one command: build with `-fsanitize=thread` and run with `TSAN_OPTIONS=suppressions=<repo>/tests/tsan.supp`.
 
 ## Development Notes
 
