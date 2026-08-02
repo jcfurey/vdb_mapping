@@ -79,7 +79,7 @@ public:
    *
    * \param config Configuration structure
    */
-  inline void setConfig(const Config& config) override
+  inline bool setConfig(const Config& config) override
   {
     // Validate occupancy-specific config before applying base config.
     // All probabilities must lie strictly inside (0, 1); values on or outside
@@ -89,14 +89,14 @@ public:
       this->logMessage(VDBMapping<float, Config, PointT>::LogLevel::Error,
                  "Probability for a miss should be in (0, 0.5] but is " +
                    std::to_string(config.prob_miss));
-      return;
+      return false;
     }
     if (!(config.prob_hit >= 0.5 && config.prob_hit < 1.0))
     {
       this->logMessage(VDBMapping<float, Config, PointT>::LogLevel::Error,
                  "Probability for a hit should be in [0.5, 1) but is " +
                    std::to_string(config.prob_hit));
-      return;
+      return false;
     }
     if (!(config.prob_thres_min > 0.0 && config.prob_thres_max < 1.0 &&
           config.prob_thres_min < config.prob_thres_max))
@@ -105,7 +105,7 @@ public:
                  "Probability thresholds must satisfy 0 < min < max < 1 but are min=" +
                    std::to_string(config.prob_thres_min) +
                    " max=" + std::to_string(config.prob_thres_max));
-      return;
+      return false;
     }
     // The clamps must strictly enclose the activation thresholds. The
     // activation comparisons are strict (value > thres_max activates, value <
@@ -120,11 +120,13 @@ public:
                  "clamp_max < 1 but are clamp_min=" +
                    std::to_string(config.prob_clamp_min) +
                    " clamp_max=" + std::to_string(config.prob_clamp_max));
-      return;
+      return false;
     }
 
-    // call base class function after validation passes
-    VDBMapping<float, Config, PointT>::setConfig(config);
+    // call base class function after validation passes; a base reject must
+    // not leave this class's log-odds half-applied below
+    if (!VDBMapping<float, Config, PointT>::setConfig(config))
+      return false;
 
     // Exclude the integration thread while the active log-odds change: it
     // reads them under the exclusive map lock and swaps them around
@@ -143,6 +145,7 @@ public:
     // bounded so the map stays adaptive to changes in the environment
     m_max_logodds = static_cast<float>(log(config.prob_clamp_max) - log(1 - config.prob_clamp_max));
     m_min_logodds = static_cast<float>(log(config.prob_clamp_min) - log(1 - config.prob_clamp_min));
+    return true;
   }
 
 protected:
