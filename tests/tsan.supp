@@ -1,0 +1,20 @@
+# ThreadSanitizer suppressions for the vdb_mapping test suite.
+#
+# Usage:
+#   colcon build --cmake-args -DCMAKE_CXX_FLAGS="-fsanitize=thread" \
+#     -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+#   TSAN_OPTIONS="suppressions=tests/tsan.supp" ./build/.../mapping_tests
+#
+# TBB is not TSan-instrumented; its internal work-stealing atomics produce
+# hundreds of false reports inside OpenVDB's parallel dilate/erode and the
+# volume ray intersector build. libOpenNI2 (dragged in by PCL's IO module)
+# performs static-init mutex games of its own.
+race:tbb::detail
+called_from_lib:libtbb.so.12
+race:openvdb::v10_0::tree::LeafBuffer
+called_from_lib:libOpenNI2.so.0
+# After these, the suite reports one ambiguous destructor-window race
+# (integrationThread mid-integrate while a stack-allocated map enters
+# ~VDBMapping, which stop()s and joins first thing). Inspection finds no
+# dangling reference and the join establishes ordering; left UNSUPPRESSED
+# deliberately so it stays visible if it ever changes shape.
