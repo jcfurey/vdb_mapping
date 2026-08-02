@@ -273,6 +273,12 @@ public:
     std::unique_lock map_lock(*m_map_mutex);
     m_vdb_grid->clear();
     m_vdb_grid = createVDBMap();
+    // Artificial areas are session state too: updateMap re-activates every
+    // coordinate in this grid each integration cycle, so leaving it populated
+    // resurrects pre-reset artificial walls in the "clean" map (active voxels
+    // at background value) that only remove_artificial_areas could purge.
+    m_artificial_area_grid = UpdateGridT::create(false);
+    m_artificial_areas_present = false;
     // The volume ray intersectors reference the replaced grid (they hold raw
     // pointers and a topology copy, not shared ownership) and must not
     // outlive it.
