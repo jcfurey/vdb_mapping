@@ -176,10 +176,10 @@ Run formatting with: `clang-format -i <file>`
 
 ## Testing
 
-Tests use **Google Test (GTest)** and are located in `tests/mapping.cpp` — 44 tests in two suites, all built on `OccupancyVDBMapping` with log-odds verification:
+Tests use **Google Test (GTest)** and are located in `tests/mapping.cpp` — 52 tests in two suites, all built on `OccupancyVDBMapping` with log-odds verification:
 
-- **`Mapping`** — config validation and activation-threshold defaults (`DefaultConfigActivatesOnFirstHit`, `ConfigurableClampingBounds`, `ClampMustStrictlyEncloseThresholds`), insertion/raycasting on and off fast mode (including degenerate and non-finite inputs), serialization round-trips and garbage rejection, map sections with pruned tiles, morphological ops, cell-centered coordinate rounding, and threading/liveness (`ExplicitStopStopsThreads`, `TimeCallbackOverridesSystemTime`, `SleepEpochShiftDoesNotFreeze`).
-- **`MappingSources`** — the per-source semantics the sonar integration relies on: clearing-only sources carve without ever adding hits, hit-only sources with beyond-range behavior, cross-source superimposition, per-source overrides applying through integration, hit dominance when same-source clouds merge, window dedup of repeated hits, and `SourceRegisteredBeforeConfigComesAlive` (the use-time `max_range` fallback).
+- **`Mapping`** — config validation and activation-threshold defaults (`DefaultConfigActivatesOnFirstHit`, `ConfigurableClampingBounds`, `ClampMustStrictlyEncloseThresholds`), insertion/raycasting on and off fast mode (including degenerate and non-finite inputs), bounded serialization and multi-grid selection, transformed/pruned map sections, deferred batch finalization, morphological ops, cell-centered coordinate rounding, and threading/liveness (`ExplicitStopStopsThreads`, `TimeCallbackOverridesSystemTime`, `SleepEpochShiftDoesNotFreeze`).
+- **`MappingSources`** — the per-source semantics the sonar integration relies on: clearing-only sources carve without ever adding hits, hit-only sources with beyond-range behavior, cross-source superimposition, per-source overrides applying through integration, hit dominance when same-source clouds merge, window dedup of repeated hits, and dynamic use-time `max_range` fallback before and after configuration changes.
 
 `tests/tsan.supp` carries ThreadSanitizer suppressions so the whole suite race-checks in one command: build with `-fsanitize=thread` and run with `TSAN_OPTIONS=suppressions=<repo>/tests/tsan.supp`.
 

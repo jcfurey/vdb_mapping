@@ -23,8 +23,7 @@ endif()
 ###########
 
 add_executable(mapping_tests mapping.cpp)
-target_compile_features(mapping_tests PUBLIC cxx_std_14)
+target_compile_features(mapping_tests PUBLIC cxx_std_17)
 target_include_directories(mapping_tests PRIVATE ${GTEST_INCLUDE_DIRS})
 target_link_libraries(mapping_tests PRIVATE vdb_mapping::vdb_mapping ${GTEST_LIBRARIES})
 add_test(NAME mapping.tests COMMAND mapping_tests)
-

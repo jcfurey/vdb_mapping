@@ -123,16 +123,17 @@ public:
       return false;
     }
 
-    // call base class function after validation passes; a base reject must
-    // not leave this class's log-odds half-applied below
-    if (!VDBMapping<float, Config, PointT>::setConfig(config))
+    // Validate the base half before taking the one transaction lock. Calling
+    // the base setConfig() here used to publish m_config_set=true and release
+    // the lock before these occupancy values were initialized, allowing the
+    // integration thread to observe a half-applied configuration.
+    if (!this->validateBaseConfig(config))
       return false;
 
-    // Exclude the integration thread while the active log-odds change: it
-    // reads them under the exclusive map lock and swaps them around
-    // per-source overrides, so an unlocked write here could race — or land
-    // between apply/clear and be reverted wholesale by the pending restore.
+    // Apply both base and occupancy fields under one lock and publish the
+    // configured flag only when the complete transaction is coherent.
     std::unique_lock map_lock(*(this->m_map_mutex));
+    this->applyBaseConfigLocked(config);
 
     // Store probabilities as log odds
     m_logodds_miss = static_cast<float>(log(config.prob_miss) - log(1 - config.prob_miss));
@@ -145,6 +146,7 @@ public:
     // bounded so the map stays adaptive to changes in the environment
     m_max_logodds = static_cast<float>(log(config.prob_clamp_max) - log(1 - config.prob_clamp_max));
     m_min_logodds = static_cast<float>(log(config.prob_clamp_min) - log(1 - config.prob_clamp_min));
+    this->m_config_set.store(true, std::memory_order_release);
     return true;
   }
 
@@ -279,7 +281,21 @@ protected:
       active_voxels.reserve(this->m_vdb_grid->activeVoxelCount());
       for (auto iter = this->m_vdb_grid->cbeginValueOn(); iter; ++iter)
       {
-        active_voxels.emplace_back(iter.getCoord(), iter.getValue());
+        if (iter.isVoxelValue())
+        {
+          active_voxels.emplace_back(iter.getCoord(), iter.getValue());
+          continue;
+        }
+
+        // A pruned active tile represents every voxel in its bounding box.
+        // Saving only iter.getCoord() restored one representative and erased
+        // the rest when sparseFill() rewrote the requested background.
+        openvdb::CoordBBox tile_bbox;
+        iter.getBoundingBox(tile_bbox);
+        for (auto coord_iter = tile_bbox.begin(); coord_iter != tile_bbox.end(); ++coord_iter)
+        {
+          active_voxels.emplace_back(*coord_iter, iter.getValue());
+        }
       }
 
       this->m_vdb_grid->sparseFill(bbox, m_min_logodds, false);

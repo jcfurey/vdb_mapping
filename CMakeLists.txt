@@ -17,7 +17,7 @@ endif()
 ## System dependencies are found with CMake's conventions
 find_package(Eigen3 REQUIRED)
 find_package(OpenVDB REQUIRED)
-find_package(PCL REQUIRED)
+find_package(PCL REQUIRED COMPONENTS common io)
 find_package(TBB REQUIRED)
 find_package(ZSTD REQUIRED)
 
@@ -33,7 +33,7 @@ add_library(${PROJECT_NAME} INTERFACE)
 target_include_directories(${PROJECT_NAME}
   INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
+    $<INSTALL_INTERFACE:include/${PROJECT_NAME}>
     ${PCL_INCLUDE_DIRS}
     ${ZSTD_INCLUDE_DIR}
 )
@@ -71,16 +71,7 @@ install(TARGETS ${PROJECT_NAME}
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin
-  INCLUDES DESTINATION include
-)
-
-## Mark cpp header files for installation
-install(
-  DIRECTORY include/${PROJECT_NAME}/
-  DESTINATION include/${PROJECT_NAME}
-  FILES_MATCHING
-  PATTERN "*.h"
-  PATTERN "*.hpp"
+  INCLUDES DESTINATION include/${PROJECT_NAME}
 )
 
 install(
@@ -94,5 +85,5 @@ install(
 )
 
 ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
-ament_export_dependencies(Eigen3 OpenVDB PCL TBB ZSTD)
-ament_auto_package(CONFIG_EXTRAS cmake/vdb_mapping-extras.cmake)
+ament_export_dependencies(Eigen3 OpenVDB TBB ZSTD)
+ament_auto_package(USE_SCOPED_HEADER_INSTALL_DIR CONFIG_EXTRAS cmake/vdb_mapping-extras.cmake)

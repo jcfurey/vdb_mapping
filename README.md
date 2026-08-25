@@ -7,7 +7,7 @@ The VDB Mapping core library was primarily developed to be used in combination w
 ## Getting Started
 
 ### Requirements
-This library requires [OpenVDB](https://www.openvdb.org/) as it is build around it. 
+This library requires [OpenVDB](https://www.openvdb.org/) as it is built around it.
 The library requires at least Version 8.3 and should work with all versions above.
 
 As the apt packages are quite outdated for most systems, we recommend building at least OpenVDB v9.0.0 from source using the provided [build instructions](https://github.com/AcademySoftwareFoundation/openvdb)
@@ -74,7 +74,7 @@ source devel/setup.bash
 # source global ros
 source /opt/ros/<your_ros_version>/setup.{zsh/bash}
 
-# create a catkin workspace
+# create a colcon workspace
 mkdir -p ~/colcon_ws/src && cd ~/colcon_ws/src
 
 # clone packages
@@ -92,6 +92,19 @@ colcon build
 # source the workspace
 source install/setup.bash
 ```
+
+### Integration and serialized-grid limits
+
+`insertPointCloud()` integrates and prunes immediately by default. Bulk
+reconstruction code can pass `finalize=false` for each insertion and call
+`finalizeUpdates()` once after the batch, avoiding repeated whole-grid pruning.
+
+`BaseConfig::max_serialized_grid_bytes` defaults to 512 MiB and bounds both
+serialization and deserialization. Applications that exchange map sections
+should set it to the largest payload they intentionally support; oversized or
+malformed grids are rejected instead of allocating from an untrusted size
+header.
+
 ## Citation
 
 Thanks that you read until here and please let us know if you run into any issues or have suggestions for improvements.

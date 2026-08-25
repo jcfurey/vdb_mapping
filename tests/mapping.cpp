@@ -1,8 +1,9 @@
 #include "gtest/gtest.h"
 #include <array>
-#include <initializer_list>
 #include <chrono>
 #include <cmath>
+#include <filesystem>
+#include <initializer_list>
 #include <limits>
 #include <vdb_mapping/OccupancyVDBMapping.hpp>
 #include <vector>
@@ -403,6 +404,66 @@ TEST(Mapping, MapSectionPreservesValues)
   EXPECT_FLOAT_EQ(section_acc.getValue(openvdb::Coord(0, 0, 1)), log_hit);
 }
 
+TEST(Mapping, TransformedFullSectionUsesSourceValuesAndDestinationTransform)
+{
+  // Source voxels are 1 m apart while the destination map is 0.5 m. The
+  // former implementation queried the source accessor at the transformed
+  // destination coordinate and converted with the source transform, so both
+  // values disappeared for any non-identity transform.
+  OccupancyVDBMapping map(0.5);
+  auto section = OccupancyVDBMapping::GridT::create(0.0F);
+  section->setTransform(openvdb::math::Transform::createLinearTransform(1.0));
+  auto section_acc = section->getAccessor();
+  section_acc.setValueOn(openvdb::Coord(1, 0, 0), 2.5F);
+  section_acc.setValueOff(openvdb::Coord(2, 0, 0), -1.25F);
+
+  Eigen::Matrix<double, 4, 4> transform = Eigen::Matrix<double, 4, 4>::Identity();
+  transform(0, 3)                       = 2.0;
+  map.transformAndApplyMapSectionGrid(section, transform);
+
+  auto acc = map.getGrid()->getAccessor();
+  EXPECT_TRUE(acc.isValueOn(openvdb::Coord(6, 0, 0)));
+  EXPECT_FLOAT_EQ(acc.getValue(openvdb::Coord(6, 0, 0)), 2.5F);
+  EXPECT_FALSE(acc.isValueOn(openvdb::Coord(8, 0, 0)));
+  EXPECT_FLOAT_EQ(acc.getValue(openvdb::Coord(8, 0, 0)), -1.25F);
+}
+
+TEST(Mapping, FullSectionApplyExpandsPrunedTiles)
+{
+  OccupancyVDBMapping map(1.0);
+  auto section = OccupancyVDBMapping::GridT::create(0.0F);
+  section->sparseFill(
+    openvdb::CoordBBox(openvdb::Coord(0, 0, 0), openvdb::Coord(7, 7, 7)), 2.0F, true);
+  ASSERT_EQ(section->activeVoxelCount(), 512U);
+  ASSERT_EQ(section->tree().leafCount(), 0U);
+
+  map.applyMapSectionGrid(section);
+  EXPECT_EQ(map.getGrid()->activeVoxelCount(), 512U);
+  EXPECT_FLOAT_EQ(map.getGrid()->getAccessor().getValue(openvdb::Coord(7, 7, 7)), 2.0F);
+}
+
+TEST(Mapping, TransformedUpdateSectionClearsItsDestinationFootprint)
+{
+  OccupancyVDBMapping map(1.0);
+  auto map_acc = map.getGrid()->getAccessor();
+  map_acc.setValueOn(openvdb::Coord(10, 0, 0), 1.0F);
+  map_acc.setValueOn(openvdb::Coord(11, 0, 0), 1.0F);
+
+  auto section = OccupancyVDBMapping::UpdateGridT::create(false);
+  section->setTransform(openvdb::math::Transform::createLinearTransform(1.0));
+  section->insertMeta("bb_min", openvdb::Vec3DMetadata(openvdb::Vec3d(0, 0, 0)));
+  section->insertMeta("bb_max", openvdb::Vec3DMetadata(openvdb::Vec3d(1, 0, 0)));
+  section->getAccessor().setValueOn(openvdb::Coord(1, 0, 0), true);
+
+  Eigen::Matrix<double, 4, 4> transform = Eigen::Matrix<double, 4, 4>::Identity();
+  transform(0, 3)                       = 10.0;
+  map.transformAndApplyMapSectionUpdateGrid(section, transform);
+
+  map_acc = map.getGrid()->getAccessor();
+  EXPECT_FALSE(map_acc.isValueOn(openvdb::Coord(10, 0, 0)));
+  EXPECT_TRUE(map_acc.isValueOn(openvdb::Coord(11, 0, 0)));
+}
+
 TEST(Mapping, ByteArrayToGridRejectsGarbage)
 {
   OccupancyVDBMapping map(1);
@@ -791,6 +852,86 @@ TEST(Mapping, SaveMapToPCDEmptyMapFails)
   EXPECT_FALSE(map.saveMapToPCD());
 }
 
+TEST(Mapping, SaveMapToPCDExpandsPrunedTiles)
+{
+  const std::filesystem::path output_dir =
+    std::filesystem::path(testing::TempDir()) / "vdb_mapping_tile_pcd";
+  std::filesystem::create_directories(output_dir);
+  for (const auto& entry : std::filesystem::directory_iterator(output_dir))
+  {
+    std::filesystem::remove_all(entry.path());
+  }
+
+  OccupancyVDBMapping map(1.0);
+  Config conf;
+  conf.map_directory_path = output_dir.string();
+  ASSERT_TRUE(map.setConfig(conf));
+  map.getGrid()->sparseFill(
+    openvdb::CoordBBox(openvdb::Coord(0, 0, 0), openvdb::Coord(7, 7, 7)), 2.0F, true);
+  ASSERT_EQ(map.getGrid()->tree().leafCount(), 0U);
+  ASSERT_TRUE(map.saveMapToPCD());
+
+  std::filesystem::path pcd_path;
+  for (const auto& entry : std::filesystem::directory_iterator(output_dir))
+  {
+    if (entry.path().extension() == ".pcd")
+    {
+      pcd_path = entry.path();
+      break;
+    }
+  }
+  ASSERT_FALSE(pcd_path.empty());
+  OccupancyVDBMapping::PointCloudT cloud;
+  ASSERT_EQ(pcl::io::loadPCDFile(pcd_path.string(), cloud), 0);
+  EXPECT_EQ(cloud.size(), 512U);
+}
+
+TEST(Mapping, SerializedGridSizeLimitRejectsOversizedInput)
+{
+  OccupancyVDBMapping map(1.0);
+  Config conf;
+  conf.max_serialized_grid_bytes = 16;
+  ASSERT_TRUE(map.setConfig(conf));
+
+  EXPECT_TRUE(map.compressString(std::string(17, 'x')).empty());
+  EXPECT_EQ(map.byteArrayToGrid<OccupancyVDBMapping::GridT>(std::vector<uint8_t>(17, 0x42)),
+            nullptr);
+}
+
+TEST(Mapping, InvalidResolutionThrows)
+{
+  EXPECT_THROW(OccupancyVDBMapping(0.0), std::invalid_argument);
+  EXPECT_THROW(OccupancyVDBMapping(std::numeric_limits<double>::quiet_NaN()),
+               std::invalid_argument);
+}
+
+TEST(Mapping, DeferredIntegrationPrunesOnlyWhenFinalized)
+{
+  OccupancyVDBMapping map(1.0);
+  Config conf;
+  ASSERT_TRUE(map.setConfig(conf));
+  map.addInputSource("test", conf.max_range, 0.0);
+  // This test drives integration synchronously. Stop the periodic worker so
+  // it cannot prune the directly-created block between the setup and the
+  // pre-finalization assertion.
+  map.stop();
+
+  OccupancyVDBMapping::PointCloudT::Ptr block(new OccupancyVDBMapping::PointCloudT);
+  for (int x = 0; x < 8; ++x)
+    for (int y = 0; y < 8; ++y)
+      for (int z = 0; z < 8; ++z)
+        block->points.emplace_back(
+          static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
+  ASSERT_TRUE(map.addPointsToGrid(block));
+  ASSERT_GT(map.getGrid()->tree().leafCount(), 0U);
+
+  OccupancyVDBMapping::PointCloudT::Ptr empty(new OccupancyVDBMapping::PointCloudT);
+  ASSERT_TRUE(map.insertPointCloud(empty, Eigen::Vector3d::Zero(), "test", false));
+  EXPECT_GT(map.getGrid()->tree().leafCount(), 0U);
+  map.finalizeUpdates();
+  EXPECT_EQ(map.getGrid()->tree().leafCount(), 0U);
+}
+
 TEST(Mapping, ByteArrayToGridSelectsCompatibleGrid)
 {
   // byteArrayToGrid used to cast only the first grid in the payload; a
@@ -1125,6 +1266,26 @@ TEST(MappingSources, SourceRegisteredBeforeConfigComesAlive)
   OccupancyVDBMapping::GridT::Accessor acc = map.getGrid()->getAccessor();
   EXPECT_TRUE(acc.isValueOn(openvdb::Coord(0, 0, 5)))
     << "source registered before setConfig stayed dead";
+}
+
+// A source with max_range=0 inherits the map-wide value dynamically. It must
+// not latch whatever global range happened to be configured at registration.
+TEST(MappingSources, MapWideRangeChangesReachFallbackSources)
+{
+  OccupancyVDBMapping map(0.1);
+  Config conf;
+  conf.max_range = 0.2;
+  conf.fast_mode = false;
+  ASSERT_TRUE(map.setConfig(conf));
+  map.addInputSource("fallback", 0.0, 0.0);
+
+  conf.max_range = 10.0;
+  ASSERT_TRUE(map.setConfig(conf));
+  OccupancyVDBMapping::PointCloudT::Ptr cloud(new OccupancyVDBMapping::PointCloudT);
+  cloud->points.emplace_back(0.0F, 0.0F, 0.5F);
+  ASSERT_TRUE(map.insertPointCloud(cloud, Eigen::Vector3d::Zero(), "fallback"));
+
+  EXPECT_TRUE(map.getGrid()->getAccessor().isValueOn(openvdb::Coord(0, 0, 5)));
 }
 
 // The section READ side must extract regions that pruning collapsed into
