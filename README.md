@@ -95,6 +95,17 @@ source install/setup.bash
 
 ### Integration and serialized-grid limits
 
+Point clouds and sensor origins passed to the core must already be in map
+coordinates. Each registered source can independently enable `ray_clearing`
+and `endpoint_hits`, and override hit/miss probabilities. A nonpositive source
+range inherits the map's current `max_range`; range filtering also applies to
+hit-only sources. Null clouds are rejected, and non-finite or unrepresentable
+voxel coordinates are skipped (an invalid sensor origin rejects the cloud).
+
+`addDataToAccumulate()` keeps one pending sample per source. Resetting or
+replacing the map discards pending samples and accumulated updates from the
+previous map. An additive PCD load (`clear_map=false`) preserves those updates.
+
 `insertPointCloud()` integrates and prunes immediately by default. Bulk
 reconstruction code can pass `finalize=false` for each insertion and call
 `finalizeUpdates()` once after the batch, avoiding repeated whole-grid pruning.

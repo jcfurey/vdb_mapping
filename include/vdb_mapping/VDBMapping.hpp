@@ -305,11 +305,7 @@ public:
     // outlive it.
     resetVolumeRayIntersectors();
 
-    for (auto& [source_id, source] : m_input_sources)
-    {
-      std::unique_lock update_grid_lock(source->update_grid_mutex);
-      source->update_grid = UpdateGridT::create(false);
-    }
+    clearPendingUpdatesLocked();
   }
 
   /*!
@@ -477,6 +473,7 @@ public:
     }
 
     std::unique_lock map_lock(*m_map_mutex);
+    clearPendingUpdatesLocked();
     m_vdb_grid = loaded_grid;
     // The volume ray intersectors reference the replaced grid (they hold raw
     // pointers and a topology copy, not shared ownership) and must not
@@ -516,6 +513,10 @@ public:
     }
     std::unique_lock map_lock(*m_map_mutex);
     const bool success = createMapFromPointCloud(cloud, set_background, clear_map);
+    if (success && clear_map)
+    {
+      clearPendingUpdatesLocked();
+    }
     // The grid contents were rewritten in place; drop any VolumeRayIntersector
     // built from the previous topology (mirrors loadMap/resetMap) so the next
     // fast-mode query does not run against a stale snapshot.
@@ -544,30 +545,52 @@ public:
                  "Tried to accumulate update for " + source_id + ". Source not available");
       return false;
     }
-    std::unique_lock update_grid_lock(source->second->update_grid_mutex);
-    UpdateGridT::Accessor update_grid_acc = source->second->update_grid->getAccessor();
+    return accumulateUpdateLocked(cloud, origin, source->second);
+  }
+
+protected:
+  // Replacing a map invalidates samples and index-space updates from the
+  // previous map. Workers hold the map lock while consuming and accumulating
+  // input, so none can reappear after this transaction completes.
+  void clearPendingUpdatesLocked()
+  {
+    for (auto& [source_id, source] : m_input_sources)
+    {
+      std::unique_lock input_lock(source->input_data_mutex);
+      source->input_data.reset();
+      std::unique_lock update_grid_lock(source->update_grid_mutex);
+      source->update_grid = UpdateGridT::create(false);
+    }
+  }
+
+  // Caller holds the map lock through input consumption and raycasting.
+  bool accumulateUpdateLocked(const typename PointCloudT::ConstPtr& cloud,
+                              const Eigen::Matrix<double, 3, 1>& origin,
+                              const std::shared_ptr<InputSource>& source)
+  {
+    std::unique_lock update_grid_lock(source->update_grid_mutex);
+    UpdateGridT::Accessor update_grid_acc = source->update_grid->getAccessor();
 
     // Resolve the map-wide fallback at USE time as well as at registration:
     // a source registered before setConfig() resolved its fallback against
     // m_max_range == 0 and stayed dead forever, even after a valid config
     // arrived.
     const double map_max_range      = m_max_range;
-    const double effective_max_range =
-      source->second->max_range > 0 ? source->second->max_range : map_max_range;
+    const double effective_max_range = source->max_range > 0 ? source->max_range : map_max_range;
     if (effective_max_range > 0)
     {
       // A source registered after the map became non-empty has no
       // intersector until the next integration cycle. Fall back to the
       // standard DDA raycast instead of dereferencing a null intersector.
-      if (m_fast_mode && source->second->volume_ray_intersector)
+      if (m_fast_mode && source->volume_ray_intersector)
       {
         return raycastPointCloud(cloud,
                                  origin,
                                  effective_max_range,
                                  update_grid_acc,
-                                 source->second->volume_ray_intersector,
-                                 source->second->ray_clearing,
-                                 source->second->endpoint_hits);
+                                 source->volume_ray_intersector,
+                                 source->ray_clearing,
+                                 source->endpoint_hits);
       }
       else
       {
@@ -576,15 +599,16 @@ public:
                                  effective_max_range,
                                  update_grid_acc,
                                  std::nullopt,
-                                 source->second->ray_clearing,
-                                 source->second->endpoint_hits);
+                                 source->ray_clearing,
+                                 source->endpoint_hits);
       }
     }
     logMessage(LogLevel::Warning,
-               "Input source " + source_id + " has no positive effective max range");
+               "Input source " + source->source_id + " has no positive effective max range");
     return false;
   }
 
+public:
   /*!
    * \brief Adds a new sensor point cloud to the accumulation pipeline
    *
@@ -696,6 +720,10 @@ public:
    */
   bool removePointsFromGrid(const typename PointCloudT::ConstPtr& cloud)
   {
+    if (!cloud)
+    {
+      return false;
+    }
     // setNodeToFree writes m_min_logodds, which is uninitialized until
     // setConfig has run; reject the call instead of storing garbage.
     if (!m_config_set)
@@ -711,13 +739,11 @@ public:
 
     for (const PointT& pt : *cloud)
     {
-      // A non-finite point would floor to an extreme coordinate (e.g. INT_MIN)
-      // and corrupt every bbox-derived operation afterwards.
-      if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z))
+      openvdb::Coord index_pt;
+      if (!worldToIndexChecked(openvdb::Vec3d(pt.x, pt.y, pt.z), index_pt))
       {
         continue;
       }
-      openvdb::Coord index_pt = this->worldToIndex(openvdb::Vec3d(pt.x, pt.y, pt.z));
       acc.modifyValueAndActiveState(index_pt, set_node);
     }
     // In-place mutation leaves any VolumeRayIntersector built from the previous
@@ -734,6 +760,10 @@ public:
    */
   bool addPointsToGrid(const typename PointCloudT::ConstPtr& cloud)
   {
+    if (!cloud)
+    {
+      return false;
+    }
     // setNodeToOccupied writes m_max_logodds, which is uninitialized until
     // setConfig has run; reject the call instead of storing garbage.
     if (!m_config_set)
@@ -748,13 +778,11 @@ public:
     };
     for (const PointT& pt : *cloud)
     {
-      // A non-finite point would floor to an extreme coordinate (e.g. INT_MIN)
-      // and corrupt every bbox-derived operation afterwards.
-      if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z))
+      openvdb::Coord index_pt;
+      if (!worldToIndexChecked(openvdb::Vec3d(pt.x, pt.y, pt.z), index_pt))
       {
         continue;
       }
-      openvdb::Coord index_pt = this->worldToIndex(openvdb::Vec3d(pt.x, pt.y, pt.z));
       acc.modifyValueAndActiveState(index_pt, set_node);
     }
     // In-place mutation leaves any VolumeRayIntersector built from the previous
@@ -791,6 +819,10 @@ public:
     const bool ray_clearing  = true,
     const bool endpoint_hits = true)
   {
+    if (!cloud)
+    {
+      return false;
+    }
     // Creating a temporary grid in which the new data is casted. This way we prevent the
     // computation of redundant probability updates in the actual map
 
@@ -804,16 +836,14 @@ public:
     // Ray origin in world coordinates
     openvdb::Vec3d ray_origin_world(origin.x(), origin.y(), origin.z());
 
-    // Check origin for NaN/inf once before the loop since it is constant
-    if (!std::isfinite(ray_origin_world.x()) || !std::isfinite(ray_origin_world.y()) ||
-        !std::isfinite(ray_origin_world.z()))
+    // Finite world coordinates can still overflow OpenVDB's int32 indices.
+    openvdb::Coord ray_origin_index;
+    if (!worldToIndexChecked(ray_origin_world, ray_origin_index))
     {
-      logMessage(LogLevel::Error, "Ray origin contains non-finite values");
+      logMessage(LogLevel::Error, "Ray origin is outside the finite grid coordinate range");
       return false;
     }
 
-    // Ray origin in index coordinates
-    openvdb::Coord ray_origin_index = this->worldToIndex(ray_origin_world);
     // Ray end point in world coordinates
     openvdb::Vec3d ray_end_world;
 
@@ -844,7 +874,11 @@ public:
         max_range_ray = true;
       }
 
-      openvdb::Coord ray_end_index = this->worldToIndex(ray_end_world);
+      openvdb::Coord ray_end_index;
+      if (!worldToIndexChecked(ray_end_world, ray_end_index))
+      {
+        continue;
+      }
       if (ray_clearing)
       {
         // Decide based on the provided intersector rather than m_fast_mode so a
@@ -953,6 +987,24 @@ public:
     openvdb::Vec3d index_coord = m_vdb_grid->worldToIndex(world_coordinate);
     return openvdb::Coord::floor(
       openvdb::Vec3d(index_coord.x() + 0.5, index_coord.y() + 0.5, index_coord.z() + 0.5));
+  }
+
+  // Validate external points before converting a floating-point coordinate
+  // to OpenVDB's signed integer lattice. The caller holds the map lock.
+  bool worldToIndexChecked(const openvdb::Vec3d& world_coordinate, openvdb::Coord& coordinate) const
+  {
+    const openvdb::Vec3d index = m_vdb_grid->worldToIndex(world_coordinate);
+    for (int axis = 0; axis < 3; ++axis)
+    {
+      const double rounded = std::floor(index[axis] + 0.5);
+      if (!std::isfinite(rounded) || rounded < std::numeric_limits<std::int32_t>::min() ||
+          rounded > std::numeric_limits<std::int32_t>::max())
+      {
+        return false;
+      }
+      coordinate[axis] = static_cast<std::int32_t>(rounded);
+    }
+    return true;
   }
 
   /*!
@@ -2331,11 +2383,22 @@ public:
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         continue;
       }
-      std::pair<typename PointCloudT::ConstPtr, Eigen::Matrix<double, 3, 1> > measurement;
-      measurement = *source->input_data;
-      source->input_data.reset();
       lock.unlock();
-      accumulateUpdate(measurement.first, measurement.second, source_id);
+      {
+        // Match resetMap/addDataToAccumulate's map -> input lock order.
+        // Keep the map lock until accumulation completes: otherwise reset
+        // can clear the map after we pop a sample but before we insert it.
+        std::shared_lock map_lock(*m_map_mutex);
+        lock.lock();
+        if (!source->input_data || m_thread_stop_signal)
+        {
+          continue;
+        }
+        auto measurement = std::move(*source->input_data);
+        source->input_data.reset();
+        lock.unlock();
+        accumulateUpdateLocked(measurement.first, measurement.second, source);
+      }
       sleepUntilOrStop(sleep_time, effective_period);
     }
     logMessage(LogLevel::Info, "Thread for source " + source_id + " received stop signal.");
