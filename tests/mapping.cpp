@@ -1457,6 +1457,103 @@ TEST(Mapping, SleepEpochShiftDoesNotFreeze)
   EXPECT_LT(waited, 2.0);
 }
 
+TEST(MappingSources, ResetDiscardsPendingWorkerInput)
+{
+  OccupancyVDBMapping map(0.1);
+  // Workers cannot consume this cloud until setConfig(). Reset must discard
+  // it along with the already accumulated update grids.
+  map.addInputSource("hits", 10.0, 0.0, false, true);
+  map.addDataToAccumulate(TwoSourceMap::cloud({{1.0, 0.0, 0.0}}), Eigen::Vector3d::Zero(), "hits");
+  map.resetMap();
+  Config config;
+  config.accumulation_period = 0.01;
+  ASSERT_TRUE(map.setConfig(config));
+  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  map.stop();
+  map.integrateUpdate();
+  EXPECT_TRUE(map.getGrid()->empty());
+
+  // Reset must leave the source usable for the next session.
+  ASSERT_TRUE(
+    map.insertPointCloud(TwoSourceMap::cloud({{2.0, 0.0, 0.0}}), Eigen::Vector3d::Zero(), "hits"));
+  EXPECT_EQ(map.getGrid()->activeVoxelCount(), 1U);
+  EXPECT_TRUE(map.getGrid()->tree().isValueOn(openvdb::Coord(20, 0, 0)));
+}
+
+TEST(MappingSources, OutOfBoundsCoordinatesAreSkipped)
+{
+  TwoSourceMap f;
+  f.map.addInputSource("hits", 1.0e40, 0.0, false, true);
+  const auto cloud = f.cloud({{1.0, 0.0, 0.0}, {1.0e30, 0.0, 0.0}, {-1.0e30, 0.0, 0.0}});
+  ASSERT_TRUE(f.map.insertPointCloud(cloud, Eigen::Vector3d::Zero(), "hits"));
+  EXPECT_EQ(f.map.getGrid()->activeVoxelCount(), 1U);
+  EXPECT_TRUE(f.map.getGrid()->tree().isValueOn(openvdb::Coord(10, 0, 0)));
+  EXPECT_FALSE(f.map.insertPointCloud(cloud, Eigen::Vector3d(1.0e30, 0.0, 0.0), "hits"));
+}
+
+TEST(Mapping, DirectGridEditsSkipOutOfBoundsCoordinates)
+{
+  TwoSourceMap f;
+  const auto cloud = f.cloud({{1.0, 0.0, 0.0}, {1.0e30, 0.0, 0.0}, {-1.0e30, 0.0, 0.0}});
+  ASSERT_TRUE(f.map.addPointsToGrid(cloud));
+  EXPECT_EQ(f.map.getGrid()->activeVoxelCount(), 1U);
+  ASSERT_TRUE(f.map.removePointsFromGrid(cloud));
+  EXPECT_EQ(f.map.getGrid()->tree().leafCount(), 1U);
+  EXPECT_LT(f.map.getGrid()->tree().getValue(openvdb::Coord(10, 0, 0)), 0.0F);
+  EXPECT_FLOAT_EQ(
+    f.map.getGrid()->tree().getValue(openvdb::Coord(std::numeric_limits<int32_t>::min(), 0, 0)),
+    0.0F);
+}
+
+TEST(Mapping, NullPointCloudsAreRejected)
+{
+  TwoSourceMap f;
+  f.map.addInputSource("hits", 10.0, 0.0);
+  EXPECT_FALSE(f.map.insertPointCloud(nullptr, Eigen::Vector3d::Zero(), "hits"));
+  EXPECT_FALSE(f.map.addPointsToGrid(nullptr));
+  EXPECT_FALSE(f.map.removePointsFromGrid(nullptr));
+  EXPECT_TRUE(f.map.getGrid()->empty());
+}
+
+TEST(Mapping, LoadingMapDiscardsPreviousAccumulation)
+{
+  TwoSourceMap f;
+  f.map.addInputSource("hits", 10.0, 0.0, false, true);
+  const auto old_cloud = f.cloud({{1.0, 0.0, 0.0}});
+  f.feed(old_cloud, Eigen::Vector3d::Zero(), "hits");
+
+  auto replacement = f.map.createVDBMap();
+  replacement->getAccessor().setValueOn(openvdb::Coord(20, 0, 0), 3.0F);
+  const auto vdb_path = testing::TempDir() + "vdb_mapping_replacement.vdb";
+  openvdb::io::File file(vdb_path);
+  file.write(openvdb::GridPtrVec{replacement});
+  file.close();
+  ASSERT_TRUE(f.map.loadMap(vdb_path));
+  f.map.integrateUpdate();
+  EXPECT_EQ(f.map.getGrid()->activeVoxelCount(), 1U);
+  EXPECT_FALSE(f.map.getGrid()->tree().isValueOn(openvdb::Coord(10, 0, 0)));
+  EXPECT_TRUE(f.map.getGrid()->tree().isValueOn(openvdb::Coord(20, 0, 0)));
+  std::filesystem::remove(vdb_path);
+
+  // A replacing PCD load has the same boundary; an additive load preserves
+  // the pending observation.
+  auto pcd_cloud      = f.cloud({{2.0, 0.0, 0.0}, {1.0e30, 0.0, 0.0}});
+  pcd_cloud->width    = pcd_cloud->size();
+  pcd_cloud->height   = 1;
+  const auto pcd_path = testing::TempDir() + "vdb_mapping_replacement.pcd";
+  ASSERT_EQ(pcl::io::savePCDFileBinary(pcd_path, *pcd_cloud), 0);
+  f.feed(old_cloud, Eigen::Vector3d::Zero(), "hits");
+  ASSERT_TRUE(f.map.loadMapFromPCD(pcd_path, false, true));
+  f.map.integrateUpdate();
+  EXPECT_EQ(f.map.getGrid()->activeVoxelCount(), 1U);
+  EXPECT_FALSE(f.map.getGrid()->tree().isValueOn(openvdb::Coord(10, 0, 0)));
+  f.feed(old_cloud, Eigen::Vector3d::Zero(), "hits");
+  ASSERT_TRUE(f.map.loadMapFromPCD(pcd_path, false, false));
+  f.map.integrateUpdate();
+  EXPECT_EQ(f.map.getGrid()->activeVoxelCount(), 2U);
+  std::filesystem::remove(pcd_path);
+}
+
 } // namespace vdb_mapping
 
 int main(int argc, char** argv)
