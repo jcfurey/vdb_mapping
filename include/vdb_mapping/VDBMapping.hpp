@@ -475,6 +475,11 @@ public:
     std::unique_lock map_lock(*m_map_mutex);
     clearPendingUpdatesLocked();
     m_vdb_grid = loaded_grid;
+    // As in resetMap: updateMap re-activates every artificial-area coordinate
+    // each integration, so walls from before the load would reappear in the
+    // loaded map (at scaled positions if its resolution differs).
+    m_artificial_area_grid->clear();
+    m_artificial_areas_present = false;
     // The volume ray intersectors reference the replaced grid (they hold raw
     // pointers and a topology copy, not shared ownership) and must not
     // outlive it. They are rebuilt on the next integration cycle.
@@ -516,6 +521,8 @@ public:
     if (success && clear_map)
     {
       clearPendingUpdatesLocked();
+      m_artificial_area_grid->clear();
+      m_artificial_areas_present = false;
     }
     // The grid contents were rewritten in place; drop any VolumeRayIntersector
     // built from the previous topology (mirrors loadMap/resetMap) so the next
@@ -642,12 +649,18 @@ public:
     m_map_mutex_requested = true;
     std::unique_lock map_lock(*m_map_mutex);
     m_map_mutex_requested = false;
+    bool integrated = false;
     for (auto& [source_id, source] : m_input_sources)
     {
       // The update grid pointer is swapped here while accumulateUpdate and
       // resetMap touch it under the same mutex; the map lock alone does not
       // serialise against resetMap's swap.
       std::unique_lock update_grid_lock(source->update_grid_mutex);
+      if (source->update_grid->empty())
+      {
+        continue;
+      }
+      integrated = true;
       // Per-source probability overrides apply for this source's grid only;
       // safe because the exclusive map lock is held for the whole loop.
       applySourceProbabilityOverride(source->prob_hit, source->prob_miss);
@@ -655,6 +668,15 @@ public:
       clearSourceProbabilityOverride();
 
       source->update_grid = UpdateGridT::create(false);
+    }
+    // The integration thread calls this every accumulation period whether or
+    // not anything arrived. With nothing integrated the map, its topology and
+    // the intersectors are unchanged: skip the whole-tree prune and the
+    // intersector rebuild (which would also prune midway through a caller's
+    // finalize_map=false batch).
+    if (!integrated)
+    {
+      return;
     }
     // The clamping update policy drives stable regions to uniform log-odds
     // values, which is precisely what enables pruning to merge them into
@@ -681,11 +703,15 @@ public:
    * Batch re-renderers can preserve one probabilistic update per observation
    * while avoiding a full growing-tree prune after every individual cloud.
    */
-  void finalizeUpdates()
+  void finalizeUpdates(const bool classify_by_value = false)
   {
     m_map_mutex_requested = true;
     std::unique_lock map_lock(*m_map_mutex);
     m_map_mutex_requested = false;
+    if (classify_by_value)
+    {
+      classifyActiveStatesLocked();
+    }
     m_vdb_grid->pruneGrid();
     updateVolumeRayIntersectors();
   }
@@ -1356,7 +1382,11 @@ public:
     openvdb::Vec3d max_index = m_vdb_grid->worldToIndex(world_bb.max());
     map_lock.unlock();
 
-    return {openvdb::Coord::floor(min_index), openvdb::Coord::floor(max_index)};
+    // Voxel k spans [k - 0.5, k + 0.5) in index space (worldToIndex rounds
+    // to the nearest centre), so the box ends are the voxels CONTAINING the
+    // corners; plain floor shifted the box half a voxel towards -inf.
+    return {openvdb::Coord::floor(min_index + openvdb::Vec3d(0.5)),
+            openvdb::Coord::floor(max_index + openvdb::Vec3d(0.5))};
   }
 
   /*!
@@ -1842,6 +1872,7 @@ public:
       source_bbox = section->evalActiveVoxelBoundingBox();
     }
 
+    UpdateGridT::ConstAccessor section_acc = section->getConstAccessor();
     if (!source_bbox.empty())
     {
       // Find an index-space AABB containing the transformed section, then
@@ -1895,7 +1926,10 @@ public:
           openvdb::Vec3d(source_index.x() + 0.5, source_index.y() + 0.5, source_index.z() + 0.5));
         if (source_bbox.isInside(source_coord))
         {
-          acc.setActiveState(*coord_iter, false);
+          // Set the whole footprint from the section here. Forward-mapping
+          // each source voxel (below) leaves gaps under rotation that this
+          // pass had just cleared.
+          acc.setActiveState(*coord_iter, section_acc.isValueOn(source_coord));
         }
       }
     }
@@ -1912,9 +1946,13 @@ public:
                              openvdb::Vec3d(buffer.x() + 0.5, buffer.y() + 0.5, buffer.z() + 0.5)),
                            true);
       };
+      // voxels inside source_bbox were already written by the footprint pass
       if (iter.isVoxelValue())
       {
-        activate_coord(iter.getCoord());
+        if (!source_bbox.isInside(iter.getCoord()))
+        {
+          activate_coord(iter.getCoord());
+        }
       }
       else
       {
@@ -1922,7 +1960,10 @@ public:
         iter.getBoundingBox(tile_bbox);
         for (auto coord_iter = tile_bbox.begin(); coord_iter != tile_bbox.end(); ++coord_iter)
         {
-          activate_coord(*coord_iter);
+          if (!source_bbox.isInside(*coord_iter))
+          {
+            activate_coord(*coord_iter);
+          }
         }
       }
     }
@@ -2036,6 +2077,35 @@ public:
   }
 
 protected:
+  /*!
+   * \brief Re-derives every voxel's active state from its value alone.
+   *
+   * Incremental updates switch the state with hysteresis (on above the upper
+   * threshold, off below the lower one), so after a batch the state depends
+   * on the ORDER the observations were integrated in: one hit followed by
+   * twenty misses stays occupied, twenty misses followed by the same hit
+   * never becomes occupied. A renderer that rebuilds the map from stored
+   * evidence wants the state to follow the accumulated evidence instead.
+   * Artificial areas stay active, as updateMap keeps them.
+   */
+  void classifyActiveStatesLocked()
+  {
+    for (auto iter = m_vdb_grid->beginValueAll(); iter; ++iter)
+    {
+      TData value = iter.getValue();
+      bool active = iter.isValueOn();
+      if (setNodeState(value, active) && active != iter.isValueOn())
+      {
+        iter.setActiveState(active);
+      }
+    }
+    typename GridT::Accessor acc = m_vdb_grid->getAccessor();
+    for (UpdateGridT::ValueOnCIter iter = m_artificial_area_grid->cbeginValueOn(); iter; ++iter)
+    {
+      acc.setActiveState(iter.getCoord(), true);
+    }
+  }
+
   void restoreMapIntegrityLocked()
   {
     auto restore_state = [&](TData& voxel_value, bool& active) {
@@ -2063,12 +2133,15 @@ protected:
       this->worldToIndex(openvdb::Vec3d(start.x(), start.y(), start.z()));
     openvdb::Coord end_index = this->worldToIndex(openvdb::Vec3d(end.x(), end.y(), end.z()));
 
-    // floor/ceil instead of truncation so negative heights round downwards
-    // and the requested positive height is fully covered
-    int negative_index = static_cast<int>(std::floor(negative_height / m_resolution));
-    int positive_index = static_cast<int>(std::ceil(positive_height / m_resolution));
+    // Voxels are centred on their index, so the layers that cover
+    // [negative_height, positive_height] run from the voxel containing the
+    // bottom to the voxel containing the top, inclusive.
+    const int negative_index =
+      static_cast<int>(std::floor(negative_height / m_resolution + 0.5));
+    const int positive_index =
+      static_cast<int>(std::floor(positive_height / m_resolution + 0.5));
 
-    for (int i = negative_index; i < positive_index; i++)
+    for (int i = negative_index; i <= positive_index; i++)
     {
       castRayIntoGrid(start_index + openvdb::Coord(0, 0, i),
                       end_index + openvdb::Coord(0, 0, i),
@@ -2531,11 +2604,14 @@ public:
 protected:
   bool validateBaseConfig(const TConfig& config) const
   {
-    if (!std::isfinite(config.max_range) || config.max_range < 0.0)
+    // Zero is not "unlimited": sources registered with max_range 0 inherit
+    // this value, and a source without a positive effective range rejects
+    // every cloud.
+    if (!std::isfinite(config.max_range) || config.max_range <= 0.0)
     {
       logMessage(LogLevel::Error,
                  "Max range of " + std::to_string(config.max_range) +
-                   " invalid. Range must be finite and non-negative.");
+                   " invalid. Range must be finite and positive.");
       return false;
     }
     if (!std::isfinite(config.accumulation_period) || config.accumulation_period <= 0.0)

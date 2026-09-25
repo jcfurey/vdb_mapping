@@ -13,8 +13,8 @@ race:tbb::detail
 called_from_lib:libtbb.so.12
 race:openvdb::v10_0::tree::LeafBuffer
 called_from_lib:libOpenNI2.so.0
-# After these, the suite reports one ambiguous destructor-window race
-# (integrationThread mid-integrate while a stack-allocated map enters
-# ~VDBMapping, which stop()s and joins first thing). Inspection finds no
-# dangling reference and the join establishes ordering; left UNSUPPRESSED
-# deliberately so it stays visible if it ever changes shape.
+# The destructor-window race once reported here (integrationThread
+# mid-integrate while a map entered ~VDBMapping) was real: stop() ran only
+# after the derived OccupancyVDBMappingT was destroyed, so in-flight virtual
+# update calls raced the vtable change. The derived destructor now stops the
+# threads first. Nothing is suppressed for it, so a recurrence stays visible.

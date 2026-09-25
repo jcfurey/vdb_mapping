@@ -74,6 +74,12 @@ public:
   {
   }
 
+  // Join the worker threads while this object is still whole. The base
+  // destructor's stop() runs after this part is destroyed, when an in-flight
+  // integration's virtual update calls would race the vtable change and
+  // dispatch to the base class's no-op updates.
+  ~OccupancyVDBMappingT() override { this->stop(); }
+
   /*!
    * \brief Handles changing the mapping config
    *

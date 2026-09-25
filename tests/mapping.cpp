@@ -649,14 +649,17 @@ TEST(Mapping, IntegrationPrunesUniformLeaves)
   map.addPointsToGrid(block);
   EXPECT_GE(map.getGrid()->tree().leafCount(), 1u);
 
-  // Trigger an integration cycle, which prunes the grid
-  OccupancyVDBMapping::PointCloudT::Ptr empty_cloud(new OccupancyVDBMapping::PointCloudT);
-  Eigen::Matrix<double, 3, 1> origin(0, 0, 0);
-  map.insertPointCloud(empty_cloud, origin, "test");
+  // Trigger an integration cycle, which prunes the grid. An empty cloud no
+  // longer does: an integration with nothing pending skips the prune.
+  OccupancyVDBMapping::PointCloudT::Ptr far_cloud(new OccupancyVDBMapping::PointCloudT);
+  far_cloud->points.emplace_back(0.0F, 0.0F, -20.0F);
+  Eigen::Matrix<double, 3, 1> origin(0, 0, -16);
+  ASSERT_TRUE(map.insertPointCloud(far_cloud, origin, "test"));
 
   // The uniform leaf is now a tile; the voxels are still active
-  EXPECT_EQ(map.getGrid()->tree().leafCount(), 0u);
-  EXPECT_EQ(map.getGrid()->activeVoxelCount(), 512u);
+  EXPECT_EQ(map.getGrid()->tree().probeConstLeaf(openvdb::Coord(64, 0, 0)), nullptr);
+  EXPECT_TRUE(map.getGrid()->tree().isValueOn(openvdb::Coord(64, 0, 0)));
+  EXPECT_GE(map.getGrid()->activeVoxelCount(), 512u);
 }
 
 TEST(Mapping, MorphologicalDilateErode)
@@ -1552,6 +1555,212 @@ TEST(Mapping, LoadingMapDiscardsPreviousAccumulation)
   f.map.integrateUpdate();
   EXPECT_EQ(f.map.getGrid()->activeVoxelCount(), 2U);
   std::filesystem::remove(pcd_path);
+}
+
+namespace {
+// The assembler's deployed occupancy model: a single keyframe hit activates,
+// clearing erodes slowly, and the activation thresholds are far apart.
+Config deployedAssemblerConfig()
+{
+  Config conf;
+  conf.max_range      = 25.0;
+  conf.fast_mode      = false;
+  conf.prob_hit       = 0.95;
+  conf.prob_miss      = 0.45;
+  conf.prob_thres_min = 0.12;
+  conf.prob_thres_max = 0.80;
+  return conf;
+}
+
+// One hit on voxel (x, 0, 5) at 0.1 m, from directly below.
+void hitColumn(OccupancyVDBMapping& map, double x)
+{
+  OccupancyVDBMapping::PointCloudT::Ptr c(new OccupancyVDBMapping::PointCloudT);
+  c->points.emplace_back(static_cast<float>(x), 0.0F, 0.5F);
+  map.accumulateUpdate(c, Eigen::Vector3d(x, 0.0, 0.0), "hits");
+  map.integrateUpdate(false);
+}
+
+// One clearing ray through voxels (x, 0, 0..5).
+void clearColumn(OccupancyVDBMapping& map, double x)
+{
+  OccupancyVDBMapping::PointCloudT::Ptr c(new OccupancyVDBMapping::PointCloudT);
+  c->points.emplace_back(static_cast<float>(x), 0.0F, 0.5F);
+  map.accumulateUpdate(c, Eigen::Vector3d(x, 0.0, 0.0), "clear");
+  map.integrateUpdate(false);
+}
+}  // namespace
+
+// Incremental updates switch state with hysteresis, so the same evidence in
+// a different order leaves a different map: one hit then twenty clears stays
+// occupied (at P ~ 0.26), twenty clears then one hit never activates. A batch
+// re-render asks finalizeUpdates to classify by the accumulated value.
+TEST(Mapping, ClassifyByValueMakesBatchOrderIrrelevant)
+{
+  OccupancyVDBMapping map(0.1);
+  ASSERT_TRUE(map.setConfig(deployedAssemblerConfig()));
+  map.stop();
+  map.addInputSource("hits", 0.0, 0.0, /*ray_clearing=*/false, /*endpoint_hits=*/true);
+  map.addInputSource("clear", 0.0, 0.0, /*ray_clearing=*/true, /*endpoint_hits=*/false);
+
+  hitColumn(map, 0.0);
+  for (int i = 0; i < 20; ++i) clearColumn(map, 0.0);
+  for (int i = 0; i < 20; ++i) clearColumn(map, 1.0);
+  hitColumn(map, 1.0);
+
+  const openvdb::Coord hit_first(0, 0, 5), hit_last(10, 0, 5);
+  auto acc = map.getGrid()->getConstAccessor();
+  ASSERT_FLOAT_EQ(acc.getValue(hit_first), acc.getValue(hit_last));
+  ASSERT_LT(acc.getValue(hit_first), 0.0F);
+  ASSERT_TRUE(acc.isValueOn(hit_first)) << "precondition: hysteresis kept the early hit";
+  ASSERT_FALSE(acc.isValueOn(hit_last));
+
+  map.finalizeUpdates(/*classify_by_value=*/true);
+  acc = map.getGrid()->getConstAccessor();
+  EXPECT_FALSE(acc.isValueOn(hit_first));
+  EXPECT_FALSE(acc.isValueOn(hit_last));
+
+  // a single hit still activates above the upper threshold
+  hitColumn(map, 2.0);
+  map.finalizeUpdates(true);
+  EXPECT_TRUE(map.getGrid()->getConstAccessor().isValueOn(openvdb::Coord(20, 0, 5)));
+}
+
+TEST(Mapping, ClassifyByValueKeepsArtificialAreas)
+{
+  OccupancyVDBMapping map(0.1);
+  ASSERT_TRUE(map.setConfig(deployedAssemblerConfig()));
+  map.stop();
+  map.addInputSource("hits", 0.0, 0.0, false, true);
+  map.addArtificialAreas({{Eigen::Vector4d(1.0, 1.0, 0.0, 1.0), Eigen::Vector4d(1.5, 1.0, 0.0, 1.0)}},
+                         -0.1, 0.1);
+  hitColumn(map, 0.0);  // integration applies the wall
+  ASSERT_TRUE(map.getGrid()->getConstAccessor().isValueOn(openvdb::Coord(12, 10, 0)));
+  map.finalizeUpdates(true);
+  EXPECT_TRUE(map.getGrid()->getConstAccessor().isValueOn(openvdb::Coord(12, 10, 0)));
+}
+
+// The integration thread runs every period. With nothing pending it must not
+// prune (a whole-tree walk that also collapses a caller's unfinished batch)
+// or rebuild intersectors.
+TEST(Mapping, IdleIntegrationLeavesTopologyAlone)
+{
+  OccupancyVDBMapping map(0.1);
+  ASSERT_TRUE(map.setConfig(deployedAssemblerConfig()));
+  map.stop();
+  map.addInputSource("hits", 0.0, 0.0, false, true);
+  auto acc = map.getGrid()->getAccessor();
+  for (int x = 0; x < 8; ++x)
+    for (int y = 0; y < 8; ++y)
+      for (int z = 0; z < 8; ++z) acc.setValueOn(openvdb::Coord(x, y, z), 1.0F);
+  ASSERT_EQ(map.getGrid()->tree().leafCount(), 1U);
+  map.integrateUpdate();
+  EXPECT_EQ(map.getGrid()->tree().leafCount(), 1U);
+  map.finalizeUpdates();
+  EXPECT_EQ(map.getGrid()->tree().leafCount(), 0U) << "an explicit finalize still prunes";
+}
+
+TEST(Mapping, ZeroMaxRangeIsRejected)
+{
+  OccupancyVDBMapping map(0.1);
+  Config conf = deployedAssemblerConfig();
+  conf.max_range = 0.0;
+  EXPECT_FALSE(map.setConfig(conf));
+}
+
+// Section boxes use the same voxel-centred cells as worldToIndex: the box
+// ends are the voxels that contain its corners.
+TEST(Mapping, SectionIndexBoxContainsItsCorners)
+{
+  OccupancyVDBMapping map(0.1);
+  const openvdb::CoordBBox box = map.createIndexBoundingBox(
+    Eigen::Vector3d(0.26, -0.26, 0.0), Eigen::Vector3d(0.56, 0.04, 0.0),
+    Eigen::Matrix4d::Identity());
+  EXPECT_EQ(box.min(), openvdb::Coord(3, -3, 0));
+  EXPECT_EQ(box.max(), openvdb::Coord(6, 0, 0));
+}
+
+// Walls cover [negative_height, positive_height] with centred voxels: at
+// 0.1 m, +-0.3 m is layers -3..3, reaching 0.35 m either side.
+TEST(Mapping, ArtificialWallsCoverTheRequestedHeight)
+{
+  OccupancyVDBMapping map(0.1);
+  ASSERT_TRUE(map.setConfig(deployedAssemblerConfig()));
+  map.stop();
+  map.addInputSource("hits", 0.0, 0.0, false, true);
+  map.addArtificialAreas({{Eigen::Vector4d(1.0, 1.0, 0.0, 1.0), Eigen::Vector4d(1.5, 1.0, 0.0, 1.0)}},
+                         -0.3, 0.3);
+  hitColumn(map, 0.0);
+  auto acc = map.getGrid()->getConstAccessor();
+  for (int z = -3; z <= 3; ++z)
+    EXPECT_TRUE(acc.isValueOn(openvdb::Coord(12, 10, z))) << "layer " << z;
+  EXPECT_FALSE(acc.isValueOn(openvdb::Coord(12, 10, 4)));
+  EXPECT_FALSE(acc.isValueOn(openvdb::Coord(12, 10, -4)));
+}
+
+TEST(Mapping, LoadingMapDropsArtificialAreas)
+{
+  OccupancyVDBMapping map(0.1);
+  ASSERT_TRUE(map.setConfig(deployedAssemblerConfig()));
+  map.stop();
+  map.addInputSource("hits", 0.0, 0.0, false, true);
+  map.addArtificialAreas({{Eigen::Vector4d(1.0, 1.0, 0.0, 1.0), Eigen::Vector4d(1.5, 1.0, 0.0, 1.0)}},
+                         -0.1, 0.1);
+
+  auto replacement = map.createVDBMap();
+  replacement->getAccessor().setValueOn(openvdb::Coord(-20, 0, 0), 3.0F);
+  const auto vdb_path = testing::TempDir() + "vdb_mapping_walls.vdb";
+  openvdb::io::File file(vdb_path);
+  file.write(openvdb::GridPtrVec{replacement});
+  file.close();
+  ASSERT_TRUE(map.loadMap(vdb_path));
+  std::filesystem::remove(vdb_path);
+
+  hitColumn(map, 0.0);
+  EXPECT_FALSE(map.getGrid()->getConstAccessor().isValueOn(openvdb::Coord(12, 10, 0)))
+    << "a wall from before the load reappeared in the loaded map";
+}
+
+// A rotated update section must reproduce its occupied block in the
+// destination without holes: the footprint pass samples every destination
+// voxel, forward mapping each source voxel did not.
+TEST(Mapping, RotatedUpdateSectionHasNoHoles)
+{
+  OccupancyVDBMapping map(1.0);
+  auto section = OccupancyVDBMapping::UpdateGridT::create(false);
+  section->setTransform(openvdb::math::Transform::createLinearTransform(1.0));
+  section->insertMeta("bb_min", openvdb::Vec3DMetadata(openvdb::Vec3d(-30, -30, 0)));
+  section->insertMeta("bb_max", openvdb::Vec3DMetadata(openvdb::Vec3d(30, 30, 0)));
+  auto section_acc = section->getAccessor();
+  for (int x = -20; x < 20; ++x)
+    for (int y = -20; y < 20; ++y) section_acc.setValueOn(openvdb::Coord(x, y, 0), true);
+
+  Eigen::Matrix4d transform = Eigen::Matrix4d::Identity();
+  const double yaw          = M_PI / 4.0;
+  transform(0, 0)           = std::cos(yaw);
+  transform(0, 1)           = -std::sin(yaw);
+  transform(1, 0)           = std::sin(yaw);
+  transform(1, 1)           = std::cos(yaw);
+  map.transformAndApplyMapSectionUpdateGrid(section, transform);
+
+  // every destination voxel whose centre maps back inside the block
+  auto acc  = map.getGrid()->getConstAccessor();
+  int holes = 0, inside = 0;
+  for (int x = -30; x <= 30; ++x)
+  {
+    for (int y = -30; y <= 30; ++y)
+    {
+      const double sx = std::cos(yaw) * x + std::sin(yaw) * y;
+      const double sy = -std::sin(yaw) * x + std::cos(yaw) * y;
+      const int ix = static_cast<int>(std::floor(sx + 0.5));
+      const int iy = static_cast<int>(std::floor(sy + 0.5));
+      if (ix < -20 || ix >= 20 || iy < -20 || iy >= 20) continue;
+      ++inside;
+      if (!acc.isValueOn(openvdb::Coord(x, y, 0))) ++holes;
+    }
+  }
+  ASSERT_GT(inside, 1000);
+  EXPECT_EQ(holes, 0) << "of " << inside;
 }
 
 } // namespace vdb_mapping
